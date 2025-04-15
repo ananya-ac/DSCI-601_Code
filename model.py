@@ -1,4 +1,3 @@
-import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
@@ -7,19 +6,12 @@ import pytorch_lightning as pl
 from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict
 import matplotlib.pyplot as plt
-from data import create_rollout_dataset
-import pdb
-from geomloss import SamplesLoss
 from FrEIA.framework import InputNode, OutputNode, Node, ReversibleGraphNet, ConditionNode
 from FrEIA.modules import GLOWCouplingBlock, PermuteRandom
 import torch.nn.functional as F
-from lightning.pytorch.loggers import WandbLogger
 from torch.distributions import Normal, Categorical
 import config
-import gymnasium as gym
-from tqdm import tqdm
-from collections import deque
-
+import wandb
 
 def NLL(z:torch.Tensor, det_log_j:torch.Tensor) -> torch.Tensor:
     """
@@ -275,7 +267,6 @@ class ConditionalNormalizingFlow(pl.LightningModule):
         # Calculate negative log-likelihood loss
         loss = output['nll']
         
-        self.log('train_loss', loss)
         return loss
     
     def validation_step(self, batch, batch_idx):
@@ -295,9 +286,9 @@ class ConditionalNormalizingFlow(pl.LightningModule):
         
         # Calculate loss
         loss = output['nll']
+        return loss
         
-        self.log('val_loss', loss)
-    
+        
     def configure_optimizers(self):
         """
         Configure optimizer.
@@ -377,7 +368,8 @@ class ActorNetwork(nn.Module):
         else:
             logits = self(state)
             if deterministic:
-                return torch.argmax(logits, dim=1)
+                action = torch.argmax(logits, dim = 1)
+                return action, None
             else:
                 dist = Categorical(logits=logits)
                 action = dist.sample()
@@ -505,6 +497,8 @@ class ActorCriticWithFlow(pl.LightningModule):
             # Critic update
             return self._critic_training_step()
         
+        
+        
     def training_step(self, batch, batch_idx):
     # Get optimizers
     
@@ -524,21 +518,24 @@ class ActorCriticWithFlow(pl.LightningModule):
         critic_loss = self._critic_training_step()
         self.manual_backward(critic_loss)
         critic_optimizer.step()
-        self.log('critic/loss', critic_loss, prog_bar=True)
-        self.log('critic/step', float(self.critic_step_counter), prog_bar=True)
-        
+        wandb.log({
+            'critic/loss': critic_loss.item(),
+            'critic/step': float(self.critic_step_counter)
+        })
         
         # Update actor less frequently
         update_actor = (self.update_counter % self.critic_updates_per_actor_update == 0)
         
         if update_actor:
             actor_optimizer.zero_grad()
-            actor_loss = self._actor_training_step()
+            actor_loss, entropy = self._actor_training_step()
             self.manual_backward(actor_loss)
             actor_optimizer.step()
-            self.log('actor/loss', actor_loss, prog_bar=True)
-            self.log('actor/step', float(self.actor_step_counter), prog_bar=True)
-        
+            wandb.log({
+                'actor/loss': actor_loss.item(),
+                'actor/entropy': entropy.mean().item(),
+                'actor/step': float(self.actor_step_counter)
+            })
         
         # Increment update counter
         self.update_counter += 1    
@@ -612,7 +609,7 @@ class ActorCriticWithFlow(pl.LightningModule):
         # Increment actor step counter
         self.actor_step_counter += 1
         
-        return total_actor_loss
+        return total_actor_loss, entropy_loss
     
     def _critic_training_step(self):
         """Train the critic using the returns."""

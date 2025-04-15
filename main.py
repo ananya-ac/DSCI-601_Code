@@ -1,4 +1,5 @@
 from train import train_model
+from eval import eval_model
 import numpy as np
 import torch
 import config 
@@ -77,9 +78,7 @@ if __name__ == "__main__":
     # Train the model
     model = train_model(**params)
     
-    # Save the model
-    torch.save(model.state_dict(), f"models/{config.env_name.lower().replace('-', '_')}_actor_critic_flow.pt")
-    
+    rewards = eval_model(checkpoint_dir='checkpoints',env_name=config.env_name)
     # Evaluate the model - examine distributions for different state-action pairs
     
     # Calculate returns if not already done

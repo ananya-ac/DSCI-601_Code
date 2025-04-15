@@ -17,7 +17,7 @@ env_name = "CartPole-v1"
 
 
 #Training 
-num_epochs = 20
+num_epochs = 10
 actor_updates = 1
 critic_updates = 5
 num_samples = 100
@@ -26,8 +26,8 @@ critic_lr = 2e-5
 max_grad_norm = 1
 critic_batch_size = 128
 actor_batch_size = 128
-update_frequency = 10000
-total_timesteps = 1000000
+update_frequency = 25000
+total_timesteps = 80000
 normalize_advantages = True
 max_episode_steps = None
 
