@@ -1,0 +1,6 @@
+torch==2.4.0
+numpy==1.26.4
+gymnasium==0.28.1
+pandas==2.2.2
+wandb==0.17.8
+tqdm==4.66.5

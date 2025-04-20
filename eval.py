@@ -40,7 +40,7 @@ def eval_model(checkpoint_dir, env_name, num_episodes=2, render=True, record_vid
     # Create the environment with proper rendering
     try:
         # First try with render_mode parameter (Gym 0.26.0+)
-        env = gym.make(env_name, render_mode="human" if render else None)
+        env = gym.make(env_name, render_mode="rgb_array" if render else None)
     except TypeError:
         # Fall back to older Gym versions
         env = gym.make(env_name)
@@ -84,6 +84,7 @@ def eval_model(checkpoint_dir, env_name, num_episodes=2, render=True, record_vid
     # Get environment dimensions
     state, _ = env.reset()
     state_dim = len(state) if hasattr(state, "__len__") else 1
+    num_actions = env.action_space.n if isinstance(env.action_space, gym.spaces.Discrete) else env.action_space.shape[0]
     
     if isinstance(env.action_space, gym.spaces.Discrete):
         action_dim = env.action_space.n
@@ -111,7 +112,8 @@ def eval_model(checkpoint_dir, env_name, num_episodes=2, render=True, record_vid
         max_grad_norm=config.max_grad_norm,   
         num_heads=config.num_heads,         
         normalize_advantages=config.normalize_advantages,  
-        critic_updates_per_actor_update=config.critic_updates
+        critic_updates_per_actor_update=config.critic_updates,
+        num_actions = num_actions
     )
     
     # Load the saved model weights
