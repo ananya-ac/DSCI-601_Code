@@ -122,7 +122,11 @@ def train_model(
     )
     
     # Setup wandb directly
-    wandb.init(project='dist_rl_online')
+    try:
+        wandb.init(project='dist_rl_online')
+    except Exception as e:
+        print(f"Failed to initialize wandb: {e}")
+        return
     
     # Log model parameters
     model_config = {
@@ -293,7 +297,7 @@ def train_model(
             returns_np = returns.detach().cpu().numpy()
 
             # Update return statistics based on calculated returns, not raw rewards
-            alpha = 0.05  # Small update factor
+            alpha = config.alpha  # Small update factor
             old_mean = model.critic.return_mean.data
             old_std = model.critic.return_std.data
 
