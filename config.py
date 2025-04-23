@@ -7,26 +7,26 @@ seed = 42
 
 
 #gym
-env_name = "CartPole-v1"
-#env_name = "Pendulum-v1"
+#env_name = "CartPole-v1"
+env_name = "Pendulum-v1"
 reward_scalar = 8.0
 
 #Training 
-num_epochs = 8
+num_epochs = 10
 actor_updates = 1
 critic_updates = 1
-num_samples = 300
+num_samples = 150
 #actor_lr = 0.000481201144669996
 #critic_lr = 0.0005084521171404696
-critic_lr  = 0.0003
-actor_lr = 0.0001
+critic_lr  = 3e-4
+actor_lr = 1e-4
 critic_batch_size = 256
 actor_batch_size = 256
 update_frequency = 2048
-total_timesteps = 50000
+total_timesteps = 200000
 k = 5
 normalize_advantages = True
-max_episode_steps = 500
+max_episode_steps = 200
 
 #logging
 log_freq = 100
@@ -38,15 +38,15 @@ eval_episodes = 2
 #rl hparams
 gamma = 0.99
 gae_lambda = 0.95
-entropy_coef = 0.01
+entropy_coef = 0.02
 value_loss_coef = 0.5
-epsilon = 0.3
-alpha = 0.05 # coeffecient for running average calculationw
+epsilon = 0.2
+alpha = 0.05 # coeffecient for running average calculation
 #model
 hidden_dim = 256
 hidden_dim_subnet = 256
-flow_dim = 6
-num_flow_layers = 4
+flow_dim = 8
+num_flow_layers = 8
 num_heads = 4
 
 #Optimizer

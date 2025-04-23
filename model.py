@@ -7,14 +7,16 @@ from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict
 import matplotlib.pyplot as plt
 from FrEIA.framework import InputNode, OutputNode, Node, ReversibleGraphNet, ConditionNode
-from FrEIA.modules import GLOWCouplingBlock, PermuteRandom
+from FrEIA.modules import GLOWCouplingBlock, PermuteRandom, AllInOneBlock
 import torch.nn.functional as F
 from torch.distributions import Normal, Categorical
 import config
 import copy
 import wandb
+from geomloss import SamplesLoss
 import pdb
 
+wasserstein_loss = SamplesLoss(loss = "gaussian")
 def NLL(z:torch.Tensor, det_log_j:torch.Tensor) -> torch.Tensor:
     """
     Negative log-likelihood loss for the normalizing flow.
@@ -26,6 +28,7 @@ def NLL(z:torch.Tensor, det_log_j:torch.Tensor) -> torch.Tensor:
     Returns:
         Negative log-likelihood loss
     """
+    
     return torch.mean(torch.sum(0.5 * z**2, dim=-1) - det_log_j)
 
 
@@ -42,58 +45,70 @@ def subnet_fc(c_in:int, c_out:int) -> nn.Module:
     """
     return nn.Sequential(
         nn.Linear(c_in, config.hidden_dim_subnet), 
-        nn.BatchNorm1d(config.hidden_dim_subnet),
         nn.ReLU(),
         nn.Linear(config.hidden_dim_subnet, c_out)
     )
 
 
-def build_normalizing_flow(input_dim:int, condition_dim:int, num_layers:int) -> ReversibleGraphNet:
-    """
-    Build a normalizing flow model using FrEIA with explicit conditioning.
-    
-    Args:
-        input_dim: Dimension of the input data (returns)
-        condition_dim: Dimension of the conditioning data (state encoding)
-        num_layers: Number of coupling layers
-        
-    Returns:
-        ReversibleGraphNet model with conditioning
-    """
-    
-    # Create the nodes for the graph
-    nodes = [InputNode(input_dim, name='input')]
-    
-    # Add a condition node for the state encoding
-    cond_node = ConditionNode(condition_dim, name='condition')
-    
-    for k in range(num_layers):
-        nodes.append(Node(
-            nodes[-1],
-            GLOWCouplingBlock,
-            {'subnet_constructor': subnet_fc, 'clamp': 2.0},
-            conditions=cond_node,  # Connect the condition node to this layer
-            name=f'coupling_{k}'
-        ))
-        nodes.append(Node(
-            nodes[-1],
-            PermuteRandom,
-            {'seed': k},
-            name=f'permute_{k}'
-        ))
-    
-    nodes.append(OutputNode(nodes[-1], name='output'))
-    
-    # Create the reversible graph with the nodes
-    model = ReversibleGraphNet(nodes + [cond_node], verbose=False)
-    
-    # Initialize parameters
-    trainable_parameters = [p for p in model.parameters() if p.requires_grad]
-    for param in trainable_parameters:
-        param.data = 0.05 * torch.randn_like(param)
-    
-    return model
+def build_normalizing_flow(input_dim: int,
+                            condition_dim: int,
+                            num_layers: int
+                           ) -> ReversibleGraphNet:
+        """
+        Build a Glow-style normalizing flow using alternating GLOWCouplingBlock and
+        PermuteRandom layers, with explicit conditioning on a state encoding.
 
+        Args:
+            input_dim: Dimension of the input (flow_dim).
+            condition_dim: Dimension of the conditioning vector.
+            num_layers: Number of coupling-permutation pairs.
+            hidden_dim_subnet: Hidden dimension for the subnetworks.
+            clamp: Affine clamping value for coupling blocks.
+
+        Returns:
+            A ReversibleGraphNet implementing the flow.
+        """
+        # Build graph nodes
+        nodes = [InputNode(input_dim, name='input')]
+        cond_node = ConditionNode(condition_dim, name='condition')
+
+        for k in range(num_layers):
+            # Coupling block
+            nodes.append(Node(
+                nodes[-1],
+                GLOWCouplingBlock,
+                {
+                    'subnet_constructor': subnet_fc,
+                    'clamp': 2.0
+                },
+                conditions=cond_node,
+                name=f'coupling_{k}'
+            ))
+            # Permutation
+            nodes.append(Node(
+                nodes[-1],
+                PermuteRandom,
+                {'seed': k},
+                name=f'permute_{k}'
+            ))
+
+        # Output node
+        nodes.append(OutputNode(nodes[-1], name='output'))
+
+        # Instantiate the reversible graph
+        model = ReversibleGraphNet(
+            nodes + [cond_node],
+            verbose=False
+        )
+
+        # Xavier-type initialization
+        for p in model.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+            else:
+                nn.init.zeros_(p)
+
+        return model
 
 # class SelfAttentionEncoder(nn.Module):
 #     """Self-attention based state-action encoder"""
@@ -151,34 +166,69 @@ def build_normalizing_flow(input_dim:int, condition_dim:int, num_layers:int) -> 
         
 #         return 
 
+import torch
+import torch.nn as nn
+
 class SimpleEncoder(nn.Module):
-    """Simple state-action encoder without attention"""
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int, continuous: bool, num_actions: int):
+    """Simple state-action encoder with LayerNorm"""
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        continuous: bool,
+        num_actions: int
+    ):
         super().__init__()
         
-        # Input embeddings for state and action features
-        self.state_embedding = nn.Linear(state_dim, hidden_dim)
-        
-        if continuous:
-            self.action_embedding = nn.Linear(action_dim, hidden_dim)
-        else:
-            # Embedding layer for discrete actions
-            self.action_embedding = nn.Embedding(num_actions, hidden_dim)
-        
-        # Fusion network for combining state and action representations
-        self.fusion_network = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+        # State embedding with LayerNorm
+        self.state_embedding = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU()
         )
         
-        # Output projection
+        # Action embedding (continuous or discrete) with LayerNorm
+        if continuous:
+            self.action_embedding = nn.Sequential(
+                nn.Linear(action_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU()
+            )
+        else:
+            # For embeddings, apply LayerNorm after lookup
+            self.action_embedding = nn.Sequential(
+                nn.Embedding(num_actions, hidden_dim),
+                nn.LayerNorm(hidden_dim)
+            )
+        
+        # Fusion network with LayerNorm after each Linear
+        self.fusion_network = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU()
+        )
+        
+        # Output projection with LayerNorm
         self.output_layer = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
+        self.continuous = continuous    
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        # state: (batch, state_dim)
+        # action: (batch, action_dim) if continuous, else (batch,) long tensor
+        s = self.state_embedding(state)
+        a = self.action_embedding(action)
+        x = torch.cat([s, a], dim=-1)
+        x = self.fusion_network(x)
+        return self.output_layer(x)
         
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         batch_size = state.shape[0]
@@ -188,13 +238,12 @@ class SimpleEncoder(nn.Module):
         state_emb = self.state_embedding(state)  # [batch_size, hidden_dim]
         
         # Embed action
-        if hasattr(self.action_embedding, 'weight') and isinstance(self.action_embedding, nn.Embedding):
+        if not self.continuous:
             # For discrete actions
             action_emb = self.action_embedding(action.long().squeeze(-1))
         else:
             # For continuous actions
             action_emb = self.action_embedding(action)
-        
         # Concatenate state and action embeddings
         combined = torch.cat([state_emb, action_emb], dim=1)  # [batch_size, 2*hidden_dim]
         
@@ -404,29 +453,39 @@ class ActorNetwork(nn.Module):
         super().__init__()
         self.continuous = continuous
         
+        # hidden layers + LayerNorm
         self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
         
         if continuous:
-            # For continuous actions, output mean and log_std
-            self.mean = nn.Linear(hidden_dim, action_dim)
-            self.log_std = nn.Parameter(torch.zeros(action_dim))
+            # state-dependent mean & std heads
+            self.mean_head    = nn.Linear(hidden_dim, action_dim)
+            self.log_std_head = nn.Linear(hidden_dim, action_dim)
         else:
-            # For discrete actions, output action logits
+            # discrete: logits head
             self.action_head = nn.Linear(hidden_dim, action_dim)
     
     def forward(self, state):
+        # LayerNorm before activation
+        x = self.fc1(state)
+        x = self.ln1(x)
+        x = F.relu(x)
         
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
+        x = self.fc2(x)
+        x = self.ln2(x)
+        x = F.relu(x)
         
         if self.continuous:
-            mean = self.mean(x)
-            std = self.log_std.exp()
+            mean    = self.mean_head(x)
+            log_std = self.log_std_head(x)
+            std     = torch.exp(log_std)
             return mean, std
         else:
-            action_logits = self.action_head(x)
-            return action_logits
+            logits = self.action_head(x)
+            return logits
     
     def get_action(self, state, deterministic):
         # if self.continuous:
@@ -440,37 +499,28 @@ class ActorNetwork(nn.Module):
         if self.continuous:
             mean, std = self(state)
             if deterministic:
-                # For deterministic actions, just return the mean
                 return torch.tanh(mean) * 2.0, None
-            else:
-                dist = Normal(mean, std)
-                # Sample actions - use regular sample() for on-policy
-                raw_action = dist.sample()
-                
-                # Get log probability of the raw action
-                log_prob = dist.log_prob(raw_action).sum(dim=-1, keepdim=True)
-                
-                # Apply tanh squashing
-                action = torch.tanh(raw_action)
-                
-                # Apply correction for the tanh squashing
-                log_prob -= torch.log(1 - action.pow(2) + 1e-6).sum(dim=-1, keepdim=True)
-                
-                # Scale to environment action range [-2.0, 2.0]
-                scaled_action = action * 2.0
-                
-                return scaled_action, log_prob
-
-    
+            
+            dist       = Normal(mean, std)
+            raw_action = dist.rsample()                              # reparameterized sample
+            logp       = dist.log_prob(raw_action).sum(-1, keepdim=True)
+            
+            action     = torch.tanh(raw_action)
+            # Jacobian correction term: log |d(tanh)/d(raw_action)| = -log(1 - tanh^2)
+            logp      -= torch.log(1 - action.pow(2) + 1e-6).sum(-1, keepdim=True)
+            
+            scaled     = action * 2.0
+            return scaled, logp
+        
         else:
             logits = self(state)
             if deterministic:
-                action = torch.argmax(logits, dim = 1)
-                return action, None
-            else:
-                dist = Categorical(logits=logits)
-                action = dist.sample()
-                return action, dist.log_prob(action)
+                a = torch.argmax(logits, dim=1)
+                return a, None
+            dist   = Categorical(logits=logits)
+            action = dist.sample().unsqueeze(-1)
+            logp   = dist.log_prob(action.squeeze(-1)).unsqueeze(-1)
+            return action, logp
 
 
 class ActorCriticWithFlow(pl.LightningModule):
@@ -533,7 +583,7 @@ class ActorCriticWithFlow(pl.LightningModule):
         self.automatic_optimization = False
         self.critic_updates_per_actor_update = critic_updates_per_actor_update
         self.update_counter = 0
-        self.ppo_update_frequency = 4  
+        self._old_synced = False   
         self.critic_batch = None
         self.critic_returns = None
         self.advantages = None
@@ -542,25 +592,18 @@ class ActorCriticWithFlow(pl.LightningModule):
 
         
         
-    def get_value(self, states, actions):
-        """
-        Get value estimate (mean of distribution) for state-action pairs.
-        """
-        
-        with torch.no_grad():
-            output = self.critic(states, actions, rev=True, return_value = None, num_samples=config.num_samples)
-            #output = self.critic(states, actions)
-            #values = output
-            values = output['mean']
-            
-        return values
     
     def compute_gae(self, rewards, values, next_values, dones):
         """
         Compute Generalized Advantage Estimation.
         """
+        
+        if rewards.dim() > 2:
+            rewards = rewards.squeeze(-1)
+            dones = dones.squeeze(-1)
         deltas = rewards + self.gamma * next_values * (1 - dones) - values
         advantages = torch.zeros_like(rewards)
+        
         
         gae = 0
         for t in reversed(range(len(rewards))):
@@ -638,28 +681,29 @@ class ActorCriticWithFlow(pl.LightningModule):
         self.manual_backward(critic_loss)
         self.clip_gradients(critic_optimizer, gradient_clip_val=config.max_grad_norm, gradient_clip_algorithm="norm")
         critic_optimizer.step()
-        # wandb.log({
-        #     'critic/loss': critic_loss.item(),
-        #     'critic/step': float(self.critic_step_counter)
-        # })
+        
         
         # Update actor less frequently
         update_actor = (self.update_counter % self.critic_updates_per_actor_update == 0)
         
         if update_actor:
+            if not self._old_synced:
+                self.old_actor.load_state_dict(self.actor.state_dict())
+                self._old_synced = True
+            
             actor_optimizer.zero_grad()
-            actor_loss, entropy = self._actor_training_step()
+            actor_loss = self._actor_training_step()
             self.manual_backward(actor_loss)
             self.clip_gradients(actor_optimizer, gradient_clip_val=config.max_grad_norm, gradient_clip_algorithm="norm")
             actor_optimizer.step()
-            # wandb.log({
-            #     'actor/loss': actor_loss.item(),
-            #     'actor/entropy': entropy.mean().item(),
-            #     'actor/step': float(self.actor_step_counter)
-            # })
+            
         
         # Increment update counter
         self.update_counter += 1    
+    
+    def on_train_epoch_end(self):
+        # called once at the end of the epoch — now clear the flag
+        self._old_synced = False
 
     
     def prepare_training_data(self, batch):
@@ -669,7 +713,17 @@ class ActorCriticWithFlow(pl.LightningModule):
         rewards = batch['rewards']
         dones = batch['dones']
         next_states = batch['next_states']
-        
+        if states.dim() > 2:
+            states = states.squeeze(-1)
+            
+        if actions.dim() > 2:
+            actions = actions.squeeze(-1)
+        if rewards.dim() > 2:
+            rewards = rewards.squeeze(-1)
+        if dones.dim() > 2:
+            dones = dones.squeeze(-1)
+        if next_states.dim() > 2:
+            next_states = next_states.squeeze(-1)
         states = states.to(self.device)
         actions = actions.to(self.device)
         rewards = rewards.to(self.device)
@@ -693,6 +747,9 @@ class ActorCriticWithFlow(pl.LightningModule):
         self.critic_batch = {'states': states, 'actions': actions}
         self.critic_returns = returns
         self.advantages = advantages
+        self.critic.return_mean.data = returns.mean()
+        self.critic.return_std.data = returns.std() + 1e-6
+    
     
     
     def _actor_training_step(self):
@@ -709,18 +766,14 @@ class ActorCriticWithFlow(pl.LightningModule):
                 old_dist = Normal(old_mean, old_std)
                 
                 # Convert bounded actions back to raw actions
-                scaled_actions = flat_actions  # These are scaled to [-2, 2]
-                tanh_actions = scaled_actions / 2.0  # Scale back to [-1, 1]
-                
-                # Apply atanh to get back to raw actions (inverse of tanh)
-                tanh_actions = torch.clamp(tanh_actions, -0.99999, 0.99999)
-                raw_actions = 0.5 * torch.log((1 + tanh_actions) / (1 - tanh_actions))
+                tanh_a     = flat_actions / 2.0
+                raw_actions = torch.atanh(tanh_a.clamp(-0.99999, 0.99999))
                 
                 # Calculate log probability of raw actions
                 old_log_probs = old_dist.log_prob(raw_actions).sum(dim=-1, keepdim=True)
                 
                 # Apply correction for the change of variables (tanh transformation)
-                old_log_probs -= torch.log(1 - tanh_actions.pow(2) + 1e-6).sum(dim=-1, keepdim=True)
+                old_log_probs -= torch.log(1 - torch.tanh(raw_actions).pow(2) + 1e-6).sum(dim=-1, keepdim=True)
             else:
                 old_logits = self.old_actor(flat_states)
                 old_dist = Categorical(logits=old_logits)
@@ -774,10 +827,9 @@ class ActorCriticWithFlow(pl.LightningModule):
                     )
                 )
         
-        # Clamp log probabilities to prevent numerical instability
-        log_probs = torch.clamp(log_probs, min=-20.0)
-        old_log_probs = torch.clamp(old_log_probs, min=-20.0)
-        
+        # Clamp the log probabilities to avoid numerical issues
+        old_log_probs = torch.clamp(old_log_probs, min=-10, max=10)
+        log_probs = torch.clamp(log_probs, min=-10, max=10)
         # Compute probability ratio between new and old policies
         ratio = torch.exp(log_probs - old_log_probs)
         
@@ -795,33 +847,34 @@ class ActorCriticWithFlow(pl.LightningModule):
         entropy_loss = -self.entropy_coef * entropy.mean()
         
         # Combine losses
-        total_actor_loss = actor_loss + entropy_loss
+        total_actor_loss = actor_loss + entropy_loss + kl_div
         
-        # Log metrics
-        # wandb.log({
-        #     'actor/advantage': advantages.mean().item(),
-        #     'actor/log_probs': log_probs.mean().item(),
-        #     'actor/old_log_probs': old_log_probs.mean().item(),
-        #     'actor/ratio': ratio.mean().item(),
-        #     'actor/policy_loss': actor_loss.item(),
-        #     'actor/entropy_loss': entropy_loss.item(),
-        #     'actor/kl_divergence': kl_div.item()
-        # })
-        
-        # Increment actor step counter
         self.actor_step_counter += 1
         
-        # Update the old policy periodically
-        if self.actor_step_counter % self.ppo_update_frequency == 0:
-            self.old_actor.load_state_dict(self.actor.state_dict())
+        # Log metrics
+        wandb.log({
+            'actor/advantage': advantages.mean().item(),
+            'actor/log_probs': log_probs.mean().item(),
+            'actor/old_log_probs': old_log_probs.mean().item(),
+            'actor/ratio': ratio.mean().item(),
+            'actor/policy_loss': actor_loss.item(),
+            'actor/entropy_loss': entropy_loss.item(),
+            'actor/kl_divergence': kl_div.item(),
+            'actor/step': int(self.actor_step_counter),
+            'actor/clipped_ratio': clipped_ratio.mean().item(),
+        })
+        
+        # Increment actor step counter
+        
             
-        return total_actor_loss, entropy
+        return total_actor_loss
         
     def _critic_training_step(self):
         """Train the critic using the returns."""
         flat_states = self.critic_batch['states']
         flat_actions = self.critic_batch['actions']
         returns = self.critic_returns
+        
         
         # Sample a subset of the batch for critic update if batch_size is specified
         if hasattr(self.hparams, 'critic_batch_size') and self.hparams.critic_batch_size and self.hparams.critic_batch_size < len(flat_states):
@@ -838,11 +891,21 @@ class ActorCriticWithFlow(pl.LightningModule):
         critic_output = self.critic(critic_states, critic_actions, critic_returns)
         critic_loss = self.value_loss_coef * critic_output['nll'].mean()
         
+        samples = self.critic(critic_states, critic_actions, return_value=None, num_samples=10, rev=True)['mean']
+        mse_loss = F.mse_loss(samples, critic_returns)
+        critic_loss += mse_loss
+        
+        
         # critic_output = self.critic(critic_states, critic_actions)
         # critic_loss = self.value_loss_coef * critic_output.mean()
         
-        
-        
+        wandb.log({
+            'critic/loss': critic_loss.item(),
+            'critic/step': float(self.critic_step_counter),
+            
+            
+            })
+      
         # Increment critic step counter
         self.critic_step_counter += 1
         

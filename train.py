@@ -1,4 +1,4 @@
-import gym
+import gymnasium as gym
 import torch
 import numpy as np
 from collections import deque
@@ -11,6 +11,10 @@ from model import ActorCriticWithFlow
 import os
 import wandb
 import config
+from stable_baselines3.common.buffers import ReplayBuffer
+
+
+
 import pdb
 
 def save_model_on_best_reward(model, recent_rewards, best_avg_reward, checkpoint_dir="./checkpoints/"):
@@ -94,7 +98,14 @@ def train_model(
     # Create environments
     env = gym.make(env_name)
     num_actions = env.action_space.n if not continuous else env.action_space.shape[0]
-
+    
+    
+    buffer = ReplayBuffer(
+        buffer_size=25000,
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        device=config.device,
+    )
     
     if max_episode_steps is not None:
         env._max_episode_steps = max_episode_steps
@@ -168,17 +179,13 @@ def train_model(
     
     pbar = tqdm(total=total_timesteps, desc="Training")
     timestep = 0
-    
-    # Initialize normalization statistics with some defaults
-    # These will be updated based on collected returns
-    # model.critic.return_mean.data = torch.tensor(0.0, dtype=torch.float32)
-    # model.critic.return_std.data = torch.tensor(1.0, dtype=torch.float32)
+    update_frequency = config.update_frequency * 10
+
     
     initial_actor_lr = actor_lr
     initial_critic_lr = critic_lr
     current_actor_lr = initial_actor_lr
     current_critic_lr = initial_critic_lr
-    
     while timestep < total_timesteps:
         # Convert state to tensor
         if len(state.shape) != 2:
@@ -186,39 +193,51 @@ def train_model(
         else:
             state_tensor = torch.FloatTensor(state)
             
-            if state_tensor.shape[0] != 1:
-                state_tensor = state_tensor.T
+            # if state_tensor.shape[0] != 1:
+            #     state_tensor = state_tensor.T
 
         # Select action
         with torch.no_grad():
             model = model.to(config.device)
             state_tensor = state_tensor.to(config.device)
-            action = model.act(state_tensor, deterministic=False)
+            action_tensor = model.act(state_tensor, deterministic=False)
             if continuous:
-                action_np = action.squeeze().cpu().numpy()
+                action_np = action_tensor.squeeze().cpu().numpy()
                 if len(action_np.shape) == 0:
                     action_np = action_np.reshape(1,-1)
+                    action = action_np
             else:
-                action_np = action.item()
+                action = action_tensor.item()
+                action_np = action_tensor.cpu().numpy()
         
         # Take step in environment
          
-        next_state, reward, terminated, truncated, _ = env.step(action_np)
+        next_state, reward, terminated, truncated, _ = env.step(action)
+        if(len(next_state.shape) > 1):
+            next_state = np.squeeze(next_state)
+       
         
-        if type(reward) == np.ndarray:
-            reward = reward.item()
-        
+        # if type(reward) == np.ndarray:
+        #     reward = reward.item()
         done = terminated or truncated
+        buffer.add(
+            obs=state,
+            next_obs=next_state,
+            action=action_np,
+            reward=reward,
+            done=done,
+            infos=[{}]
+        )
         
         # Store transition
-        if len(next_state.shape) == 2:
-            next_state = np.squeeze(next_state)
+        # if len(next_state.shape) == 2:
+        #     next_state = np.squeeze(next_state)
         
-        states.append(state)
-        actions.append(action_np)
-        rewards.append(reward)
-        dones.append(done)
-        next_states.append(next_state)
+        # states.append(state)
+        # actions.append(action_np)
+        # rewards.append(reward)
+        # dones.append(done)
+        # next_states.append(next_state)
         
         # Update for next iteration
         state = next_state
@@ -240,8 +259,7 @@ def train_model(
                 wandb.log({
                     'env/avg_reward_100': avg_reward,
                     'env/episodes_completed': episodes_completed,
-                    'env/timestep': timestep,
-                    
+                    'env/timestep': timestep
                 })
                 
             
@@ -252,112 +270,55 @@ def train_model(
             episode_length = 0
         
         # Update model when enough data is collected
-        if len(states) >= update_frequency:
-            tqdm.write(f"Updating model at timestep {timestep} with {len(states)} experiences...")
-            # Update return normalization statistics
-            # all_rewards = np.array(rewards)
-            # model.critic.return_mean.data = torch.tensor(np.mean(all_rewards), dtype=torch.float32)
-            # model.critic.return_std.data = torch.tensor(np.std(all_rewards) if np.std(all_rewards) > 1e-8 else 1.0, dtype=torch.float32)
+        
+        if buffer.size() >= update_frequency and timestep % update_frequency == 0:
+            update_frequency = config.update_frequency
+            # sample a batch
             
-            # Convert experiences to tensors
-            states_tensor = torch.FloatTensor(np.array(states))
-            
-            if continuous:
-                actions_tensor = torch.FloatTensor(np.array(actions))
-            else:
-                actions_tensor = torch.LongTensor(np.array(actions))
-            
-            rewards_tensor = torch.FloatTensor(np.array(rewards)).unsqueeze(1)
-            if continuous:
-                rewards_tensor = (rewards_tensor + config.reward_scalar) / config.reward_scalar
-            
-            dones_tensor = torch.FloatTensor(np.array(dones)).unsqueeze(1)
-            next_states_tensor = torch.FloatTensor(np.array(next_states))
-            
-            # Create batch
+            update_frequency = config.update_frequency
+            batch = buffer.sample(batch_size=config.update_frequency)
+            states_tensor      = batch.observations
+            actions_tensor     = batch.actions
+            rewards_tensor     = batch.rewards.unsqueeze(1)
+            next_states_tensor = batch.next_observations
+            dones_tensor       = batch.dones.unsqueeze(1).float()
+
+            # prepare for advantage/return calc
             full_batch = {
-                'states': states_tensor,
-                'actions': actions_tensor,
-                'rewards': rewards_tensor,
-                'dones': dones_tensor,
+                'states':      states_tensor,
+                'actions':     actions_tensor,
+                'rewards':     rewards_tensor,
+                'dones':       dones_tensor,
                 'next_states': next_states_tensor
             }
-            
-            
-            # Process the full batch to calculate advantages and returns
             with torch.no_grad():
-                
                 model.prepare_training_data(full_batch)
-            
-            # Get the processed data
-            flat_states = model.critic_batch['states']
+
+            flat_states  = model.critic_batch['states']
             flat_actions = model.critic_batch['actions']
-            advantages = model.advantages
-            returns = model.critic_returns
-            returns_np = returns.detach().cpu().numpy()
+            advantages   = model.advantages
+            returns      = model.critic_returns
 
-            # Update return statistics based on calculated returns, not raw rewards
-            alpha = config.alpha  # Small update factor
-            old_mean = model.critic.return_mean.data
-            old_std = model.critic.return_std.data
+            dataset     = TensorDataset(flat_states, flat_actions, advantages, returns)
+            data_loader = DataLoader(dataset, batch_size=critic_batch_size, shuffle=True)
 
-            new_mean = torch.tensor(np.mean(returns_np), dtype=torch.float32)
-            new_std = torch.tensor(np.std(returns_np) if np.std(returns_np) > 1e-8 else 1.0, dtype=torch.float32)
-
-            model.critic.return_mean.data = old_mean * (1-alpha) + new_mean * alpha
-            model.critic.return_std.data = old_std * (1-alpha) + new_std * alpha
-            # # Create a dataset and data loader for this batch of experiences
-            dataset = TensorDataset(flat_states, flat_actions, advantages, returns)
-            # actor_data_loader = DataLoader(
-            #     dataset, 
-            #     batch_size=batch_size,
-            #     shuffle=True,
-            #     drop_last=False
-            # )
-            
-            # And another for critic with the critic batch size
-            # critic_data_loader = DataLoader(
-            #     dataset, 
-            #     batch_size=critic_batch_size,
-            #     shuffle=True,
-            #     drop_last=False
-            # )
-            data_loader = DataLoader(
-                dataset, 
-                batch_size=critic_batch_size,
-                shuffle=True,
-                drop_last=False
-            )
-            
-            # Build train_dataloaders dictionary for each optimizer
-            # train_dataloaders = {
-            #     0: actor_data_loader,  # For actor optimizer
-            #     1: critic_data_loader  # For critic optimizer
-            # }
-            # Calculate adjusted_epochs with fewer epochs at the start and more later
-           
-            progress = timestep / total_timesteps
-            
-            
             trainer = pl.Trainer(
-                        max_epochs=config.num_epochs,
-                        enable_progress_bar=True,
-                        enable_model_summary=True,
-                        accelerator="auto",
-                        logger=False
-                    )
-            
-            
+                max_epochs=num_epochs,
+                accelerator="auto",
+                logger=False,
+            )
             trainer.fit(model, train_dataloaders=data_loader)
-            
-            
+
             actor_optimizer, critic_optimizer = model.optimizers()
             
             wandb.log({"optim/actor_lr": actor_optimizer.param_groups[0]['lr']})
             wandb.log({"optim/critic_lr": critic_optimizer.param_groups[0]['lr']})
             wandb.log({"optim/entropy_coef": model.entropy_coef})
-            lr_decay_factor = max(0.05, (1.0 - progress) ** 1.5)  # More aggressive decay
-            # 
+            
+            progress = timestep / total_timesteps
+            lr_decay_factor = max(0.1, (1.0 - progress) ** 0.30)  # Less aggressive decay
+            #lr_decay_factor = max(0.05, (1.0 - progress) ** 1.5)  # More aggressive decay
+            
             current_actor_lr = initial_actor_lr * lr_decay_factor
             current_critic_lr = initial_critic_lr * lr_decay_factor
 
@@ -369,20 +330,6 @@ def train_model(
             model.actor_lr = current_actor_lr
             model.critic_lr = current_critic_lr
             
-            if continuous:
-                wandb.log({"actor/log_std" : model.actor.log_std.item()})
-            
-            # Clear experience buffer after training
-            states = []
-            actions = []
-            rewards = []
-            dones = []
-            next_states = []
-            
-            model.reset_batch()
-            
-            
-        # Update progress bar
         pbar.update(1)
 
     # Save final model at the end of training
@@ -397,3 +344,249 @@ def train_model(
     wandb.finish()
 
     return best_avg_reward + avg_reward
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+    #     if len(states) >= update_frequency:
+    #         tqdm.write(f"Updating model at timestep {timestep} with {len(states)} experiences...")
+    #         # Update return normalization statistics
+    #         # all_rewards = np.array(rewards)
+    #         # model.critic.return_mean.data = torch.tensor(np.mean(all_rewards), dtype=torch.float32)
+    #         # model.critic.return_std.data = torch.tensor(np.std(all_rewards) if np.std(all_rewards) > 1e-8 else 1.0, dtype=torch.float32)
+            
+    #         # Convert experiences to tensors
+    #         states_tensor = torch.FloatTensor(np.array(states))
+            
+    #         if continuous:
+    #             actions_tensor = torch.FloatTensor(np.array(actions))
+    #         else:
+    #             actions_tensor = torch.LongTensor(np.array(actions))
+            
+    #         rewards_tensor = torch.FloatTensor(np.array(rewards)).unsqueeze(1)
+    #         if continuous:
+    #             rewards_tensor = (rewards_tensor + config.reward_scalar) / config.reward_scalar
+            
+    #         dones_tensor = torch.FloatTensor(np.array(dones)).unsqueeze(1)
+    #         next_states_tensor = torch.FloatTensor(np.array(next_states))
+            
+    #         # Create batch
+    #         full_batch = {
+    #             'states': states_tensor,
+    #             'actions': actions_tensor,
+    #             'rewards': rewards_tensor,
+    #             'dones': dones_tensor,
+    #             'next_states': next_states_tensor
+    #         }
+            
+            
+    #         # Process the full batch to calculate advantages and returns
+    #         with torch.no_grad():
+                
+    #             model.prepare_training_data(full_batch)
+            
+    #         # Get the processed data
+    #         flat_states = model.critic_batch['states']
+    #         flat_actions = model.critic_batch['actions']
+    #         advantages = model.advantages
+    #         returns = model.critic_returns
+    #         #returns_np = returns.detach().cpu().numpy()
+
+    #         # # Update return statistics based on calculated returns, not raw rewards
+    #         # alpha = config.alpha  # Small update factor
+    #         # old_mean = model.critic.return_mean.data
+    #         # old_std = model.critic.return_std.data
+
+    #         # new_mean = torch.tensor(np.mean(returns_np), dtype=torch.float32)
+    #         # new_std = torch.tensor(np.std(returns_np) if np.std(returns_np) > 1e-8 else 1.0, dtype=torch.float32)
+
+    #         # model.critic.return_mean.data = old_mean * (1-alpha) + new_mean * alpha
+    #         # model.critic.return_std.data = old_std * (1-alpha) + new_std * alpha
+    #         # # # Create a dataset and data loader for this batch of experiences
+    #         dataset = TensorDataset(flat_states, flat_actions, advantages, returns)
+    #         # actor_data_loader = DataLoader(
+    #         #     dataset, 
+    #         #     batch_size=batch_size,
+    #         #     shuffle=True,
+    #         #     drop_last=False
+    #         # )
+            
+    #         # And another for critic with the critic batch size
+    #         # critic_data_loader = DataLoader(
+    #         #     dataset, 
+    #         #     batch_size=critic_batch_size,
+    #         #     shuffle=True,
+    #         #     drop_last=False
+    #         # )
+    #         data_loader = DataLoader(
+    #             dataset, 
+    #             batch_size=critic_batch_size,
+    #             shuffle=True,
+    #             drop_last=False
+    #         )
+            
+    #         # Build train_dataloaders dictionary for each optimizer
+    #         # train_dataloaders = {
+    #         #     0: actor_data_loader,  # For actor optimizer
+    #         #     1: critic_data_loader  # For critic optimizer
+    #         # }
+    #         # Calculate adjusted_epochs with fewer epochs at the start and more later
+           
+    #         progress = timestep / total_timesteps
+            
+            
+    #         trainer = pl.Trainer(
+    #                     max_epochs=config.num_epochs,
+    #                     enable_progress_bar=True,
+    #                     enable_model_summary=True,
+    #                     accelerator="auto",
+    #                     logger=False
+    #                 )
+            
+            
+    #         trainer.fit(model, train_dataloaders=data_loader)
+            
+            
+    #         actor_optimizer, critic_optimizer = model.optimizers()
+            
+    #         wandb.log({"optim/actor_lr": actor_optimizer.param_groups[0]['lr']})
+    #         wandb.log({"optim/critic_lr": critic_optimizer.param_groups[0]['lr']})
+    #         wandb.log({"optim/entropy_coef": model.entropy_coef})
+    #         lr_decay_factor = max(0.05, (1.0 - progress) ** 1.5)  # More aggressive decay
+    #         # 
+    #         current_actor_lr = initial_actor_lr * lr_decay_factor
+    #         current_critic_lr = initial_critic_lr * lr_decay_factor
+
+    #         # For entropy coefficient - slower decay to maintain exploration
+    #         entropy_decay_factor = max(0.1, 1.0 - 0.7 * progress)  # Never go below 10% of initial value
+    #         model.entropy_coef = config.entropy_coef * entropy_decay_factor
+
+    #         # actor_optimizer, critic_optimizer = model.optimizers()
+    #         model.actor_lr = current_actor_lr
+    #         model.critic_lr = current_critic_lr
+            
+            
+    #         # Clear experience buffer after training
+    #         states = []
+    #         actions = []
+    #         rewards = []
+    #         dones = []
+    #         next_states = []
+            
+    #         model.reset_batch()
+            
+            
+    #     # Update progress bar
+    #     pbar.update(1)
+
+    # # Save final model at the end of training
+    # final_checkpoint_dir = "./checkpoints/final/"
+    # os.makedirs(final_checkpoint_dir, exist_ok=True)
+    # final_checkpoint_path = os.path.join(final_checkpoint_dir, f"final_model_timestep_{total_timesteps}.ckpt")
+    # torch.save(model.state_dict(), final_checkpoint_path)
+    # tqdm.write(f"Training complete. Saved final model to {final_checkpoint_path}")
+
+    # # Close environments
+    # env.close()
+    # wandb.finish()
+
+    # return best_avg_reward + avg_reward

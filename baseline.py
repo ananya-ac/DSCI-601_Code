@@ -39,20 +39,20 @@ class LivePlotCallback(BaseCallback):
 
 def main():
     # Create the training environment (no rendering)
-    train_env = gym.make('CartPole-v1')
+    train_env = gym.make("Pendulum-v1")
 
     # Instantiate the PPO model with an MLP policy and tensorboard logging
     model = PPO(
         'MlpPolicy',
         train_env,
         verbose=1,
-        tensorboard_log='./ppo_cartpole_tensorboard/'
+        
     )
 
     # Train the model with live plotting callback
     live_plot = LivePlotCallback()
     model.learn(
-        total_timesteps=50000,
+        total_timesteps=100000,
         callback=live_plot,
         tb_log_name='PPO_CartPole'
     )
@@ -62,7 +62,7 @@ def main():
     train_env.close()
 
     # Evaluation environment (with rendering)
-    eval_env = gym.make('CartPole-v1', render_mode='human')
+    eval_env = gym.make('Pendulum-v1', render_mode='human')
     obs, _info = eval_env.reset()
     for _ in range(1000):
         action, _ = model.predict(obs, deterministic=True)
