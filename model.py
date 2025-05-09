@@ -16,7 +16,7 @@ import wandb
 from geomloss import SamplesLoss
 import pdb
 
-wasserstein_loss = SamplesLoss(loss = "gaussian")
+wasserstein_loss = SamplesLoss()
 def NLL(z:torch.Tensor, det_log_j:torch.Tensor) -> torch.Tensor:
     """
     Negative log-likelihood loss for the normalizing flow.
@@ -45,70 +45,111 @@ def subnet_fc(c_in:int, c_out:int) -> nn.Module:
     """
     return nn.Sequential(
         nn.Linear(c_in, config.hidden_dim_subnet), 
-        nn.ReLU(),
+        nn.GELU(),
+        nn.Linear(config.hidden_dim_subnet, config.hidden_dim_subnet),
+        nn.GELU(),
         nn.Linear(config.hidden_dim_subnet, c_out)
     )
 
 
 def build_normalizing_flow(input_dim: int,
                             condition_dim: int,
-                            num_layers: int
+                            num_layers: int,
+                            use_conditioning: bool = True
                            ) -> ReversibleGraphNet:
-        """
-        Build a Glow-style normalizing flow using alternating GLOWCouplingBlock and
-        PermuteRandom layers, with explicit conditioning on a state encoding.
+    nodes = [InputNode(input_dim, name='input')]
 
-        Args:
-            input_dim: Dimension of the input (flow_dim).
-            condition_dim: Dimension of the conditioning vector.
-            num_layers: Number of coupling-permutation pairs.
-            hidden_dim_subnet: Hidden dimension for the subnetworks.
-            clamp: Affine clamping value for coupling blocks.
-
-        Returns:
-            A ReversibleGraphNet implementing the flow.
-        """
-        # Build graph nodes
-        nodes = [InputNode(input_dim, name='input')]
+    if use_conditioning:
         cond_node = ConditionNode(condition_dim, name='condition')
+        cond_nodes = [cond_node]
+    else:
+        cond_nodes = []
 
-        for k in range(num_layers):
-            # Coupling block
-            nodes.append(Node(
-                nodes[-1],
-                GLOWCouplingBlock,
-                {
-                    'subnet_constructor': subnet_fc,
-                    'clamp': 2.0
-                },
-                conditions=cond_node,
-                name=f'coupling_{k}'
-            ))
-            # Permutation
-            nodes.append(Node(
-                nodes[-1],
-                PermuteRandom,
-                {'seed': k},
-                name=f'permute_{k}'
-            ))
+    for k in range(num_layers):
+        kwargs = {
+            'subnet_constructor': subnet_fc,
+            'clamp': 2.0
+        }
 
-        # Output node
-        nodes.append(OutputNode(nodes[-1], name='output'))
+        # Attach condition only if enabled
+        conditions = [cond_nodes[0]] if use_conditioning else None
 
-        # Instantiate the reversible graph
-        model = ReversibleGraphNet(
-            nodes + [cond_node],
-            verbose=False
-        )
+        nodes.append(Node(
+            nodes[-1],
+            GLOWCouplingBlock,
+            kwargs,
+            conditions=conditions,
+            name=f'coupling_{k}'
+        ))
 
-        # Xavier-type initialization
-        for p in model.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-            else:
-                nn.init.zeros_(p)
+        nodes.append(Node(
+            nodes[-1],
+            PermuteRandom,
+            {'seed': k},
+            name=f'permute_{k}'
+        ))
 
-        return model
+    nodes.append(OutputNode(nodes[-1], name='output'))
+
+    model = ReversibleGraphNet(
+        nodes + cond_nodes,
+        verbose=False
+    )
+    
+
+    for p in model.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform_(p)
+        else:
+            nn.init.zeros_(p)
+
+    return model
+
+
+def build_normalizing_flow_(input_dim: int,
+                            condition_dim: int,
+                            num_layers: int,
+                            clamp=1.0
+                           ) -> ReversibleGraphNet:
+    """
+    Build a conditional normalizing flow using AllInOneBlock.
+
+    Args:
+        input_dim: Dimension of the flow input (e.g., return embedding).
+        condition_dim: Dimension of the conditioning vector (e.g., state-action encoding).
+        num_layers: Number of AllInOne blocks.
+        subnet_fc: Function defining the subnet MLP.
+        clamp: Clamping value for affine terms in AllInOneBlock.
+
+    Returns:
+        A conditional ReversibleGraphNet.
+    """
+    nodes = [InputNode(input_dim, name='input')]
+    cond_node = ConditionNode(condition_dim, name='condition')
+
+    for k in range(num_layers):
+        # AllInOneBlock (conditionally affine + built-in permutation)
+        nodes.append(Node(
+            nodes[-1],
+            AllInOneBlock,
+            {'subnet_constructor': subnet_fc, 'affine_clamping': clamp},
+            conditions=cond_node,
+            name=f'block_{k}'
+        ))
+
+    nodes.append(OutputNode(nodes[-1], name='output'))
+
+    flow = ReversibleGraphNet(nodes + [cond_node], verbose=False)
+
+    # Initialize weights
+    for p in flow.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform_(p)
+        else:
+            nn.init.zeros_(p)
+
+    return flow
+
 
 # class SelfAttentionEncoder(nn.Module):
 #     """Self-attention based state-action encoder"""
@@ -166,8 +207,6 @@ def build_normalizing_flow(input_dim: int,
         
 #         return 
 
-import torch
-import torch.nn as nn
 
 class SimpleEncoder(nn.Module):
     """Simple state-action encoder with LayerNorm"""
@@ -274,19 +313,8 @@ class SimpleEncoder(nn.Module):
 
 class ConditionalNormalizingFlow(nn.Module):
     def __init__(self, state_dim:int, action_dim:int, hidden_dim:int, flow_dim:int, num_layers:int, 
-                 learning_rate:float, normalize_returns:bool, num_heads:int,continuous:bool, num_actions):
+                 learning_rate:float, normalize_returns:bool, continuous:bool, num_actions:int, num_heads:int):
         super().__init__()
-        #self.save_hyperparameters()
-        
-        # Replace sequential encoder with self-attention encoder
-        # self.state_action_encoder = SelfAttentionEncoder(
-        #     state_dim=state_dim,
-        #     action_dim=action_dim,
-        #     hidden_dim=hidden_dim,
-        #     num_heads=num_heads,
-        #     continuous=continuous,
-        #     num_actions=num_actions
-        # )
         
         self.state_action_encoder = SimpleEncoder(
             state_dim=state_dim,
@@ -295,18 +323,35 @@ class ConditionalNormalizingFlow(nn.Module):
             continuous=continuous,
             num_actions=num_actions
         )
-        # self.state_action_encoder = SimpleEncoder(
-        #     state_dim=state_dim,
-        #     hidden_dim=hidden_dim,
-            
-        # )
         
         # Return projection layers
-        self.return_proj = nn.Linear(1, flow_dim)
-        self.inv_return_proj = nn.Linear(flow_dim, 1)
+        
+        self.return_proj = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+            nn.Linear(32, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, flow_dim),
+            nn.LayerNorm(flow_dim)
+        )
+
+        #self.return_proj = nn.Linear(1, flow_dim)
+        #self.inv_return_proj = nn.Linear(flow_dim, 1)
+        self.inv_return_proj = nn.Sequential(
+            nn.Linear(flow_dim, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+
         
         # Build the normalizing flow with explicit conditioning
-        self.flow = build_normalizing_flow(flow_dim, hidden_dim, num_layers)
+        self.flow = build_normalizing_flow_(flow_dim, hidden_dim, num_layers)
         
         self.flow_dim = flow_dim
         self.hidden_dim = hidden_dim
@@ -316,7 +361,7 @@ class ConditionalNormalizingFlow(nn.Module):
         self.normalize_returns = normalize_returns
         self.return_mean = nn.Parameter(torch.zeros(1), requires_grad=False)
         self.return_std = nn.Parameter(torch.ones(1), requires_grad=False)
-    
+        
     def forward(self, state, action, return_value, num_samples=None, rev=False):
         """
         Forward pass with state-action conditioning.
@@ -333,24 +378,26 @@ class ConditionalNormalizingFlow(nn.Module):
         """
         batch_size = state.shape[0]
         
-        # if action.dim() == 1 and self.action_dim > 1:
-        #     action = action.unsqueeze(1)
         
-        # Get self-attention encoding of state-action pair
         encoding = self.state_action_encoder(state, action)
-        #encoding = self.state_action_encoder(state)
         
         if not rev:
             # Forward direction: Return → Latent
+            
+            #wandb.log({"return_value:" : return_value[0].item()})
+            
             if return_value is None:
                 raise ValueError("Return value must be provided for forward pass in the forward direction")
-            if self.normalize_returns:
-                return_value = (return_value - self.return_mean) / self.return_std
+            # if self.normalize_returns:
+            #     return_value = (return_value - self.return_mean) / self.return_std
             # Project return to flow dimension
             return_emb = self.return_proj(return_value)
-            
             # Forward through the flow with explicit conditioning
-            z, log_det_J = self.flow([return_emb], c=[encoding], rev=False, jac=True)
+            z, log_det_J = self.flow(return_emb, c=encoding, rev=False, jac=True)
+            
+            
+            corr = torch.corrcoef(z.T)  # shape [flow_dim, flow_dim]
+  
             
             return {
                 'z': z,
@@ -368,14 +415,14 @@ class ConditionalNormalizingFlow(nn.Module):
                 encoding = encoding.repeat_interleave(num_samples, dim=0)
             
             # Transform through the flow in reverse with explicit conditioning
-            samples_emb, _ = self.flow([z], c=[encoding], rev=True, jac=False)
+            samples_emb, _ = self.flow(z, c=encoding, rev=True, jac=False)
             
             # Project back to scalar returns
             samples = self.inv_return_proj(samples_emb)
             
             if self.normalize_returns:
                 samples = samples * self.return_std + self.return_mean
-            # Reshape to [batch_size, num_samples]
+            #Reshape to [batch_size, num_samples]
             samples = samples.view(batch_size, num_samples)
             
             return {
@@ -384,50 +431,6 @@ class ConditionalNormalizingFlow(nn.Module):
                 'std': samples.std(dim=1, keepdim=True)
             }
     
-    # def training_step(self, batch, batch_idx):
-    #     """
-    #     Training step for state-action conditional model.
-        
-    #     Args:
-    #         batch: Dictionary containing 'state', 'action', and 'return'
-    #         batch_idx: Batch index
-            
-    #     Returns:
-    #         Loss value
-    #     """
-    #     state = batch['state']
-    #     action = batch['action']
-    #     return_value = batch['return']
-        
-    #     # Forward pass through the flow
-    #     output = self(state, action, return_value)
-        
-    #     # Calculate negative log-likelihood loss
-    #     loss = output['nll']
-        
-    #     return loss
-    
-        
-        
-    def configure_optimizers(self):
-        """
-        Configure optimizer.
-        
-        Returns:
-            Optimizer
-        """
-        # Get all trainable parameters
-        trainable_parameters = [p for p in self.parameters() if p.requires_grad]
-        
-        optimizer = torch.optim.Adam(
-            trainable_parameters, 
-            lr=self.learning_rate,
-            betas=config.betas,
-            eps=config.eps,
-            
-        )
-        
-        return optimizer
     
     def sample_value_distribution(self, state, action, num_samples):
         """
@@ -657,9 +660,37 @@ class ActorCriticWithFlow(pl.LightningModule):
         # Initialize step counters
         self.critic_step_counter = 0
         self.actor_step_counter = 0
+        
     
+    
+    def calculate_monte_carlo_returns(self, rewards: torch.Tensor, dones: torch.Tensor, gamma: float = None) -> torch.Tensor:
+        """
+        Compute Monte Carlo returns for a batch of trajectories.
         
+        Args:
+            rewards: Tensor of shape [batch_size, trajectory_len] — reward sequences.
+            dones: Tensor of shape [batch_size, trajectory_len] — done flags (1 if terminal).
+            gamma: Discount factor. If None, uses self.gamma.
         
+        Returns:
+            returns: Tensor of shape [batch_size, trajectory_len] — MC returns from each time step.
+        """
+        if gamma is None:
+            gamma = self.gamma
+
+        batch_size, T = rewards.shape
+        returns = torch.zeros_like(rewards)
+
+        for b in range(batch_size):
+            G = 0
+            for t in reversed(range(T)):
+                if dones[b, t]:
+                    G = 0  # reset on terminal state
+                G = rewards[b, t] + gamma * G
+                returns[b, t] = G
+
+        return returns      
+            
         
     def training_step(self, batch, batch_idx):
         # Get optimizers
@@ -677,9 +708,13 @@ class ActorCriticWithFlow(pl.LightningModule):
         
         # Always update critic
         critic_optimizer.zero_grad()
-        critic_loss = self._critic_training_step()
+        critic_loss = self._critic_training_step() 
         self.manual_backward(critic_loss)
         self.clip_gradients(critic_optimizer, gradient_clip_val=config.max_grad_norm, gradient_clip_algorithm="norm")
+        for name, p in self.critic.named_parameters():
+            if (p.grad is None or torch.all(p.grad == 0)) and p.requires_grad:
+                print(f"{name} has no gradient")
+        
         critic_optimizer.step()
         
         
@@ -730,25 +765,33 @@ class ActorCriticWithFlow(pl.LightningModule):
         dones = dones.to(self.device)
         next_states = next_states.to(self.device)
         
+        
         # Get current values
-        _, values = self.get_critic_value(states, actions=actions)
+        q_vals, v_vals = self.get_critic_value(states=states, actions=actions)
     
         # Get next state values (average over multiple sampled actions)
-        next_values = self.get_critic_value(next_states, actions=None, num_samples=5)        
-
+        next_values = self.get_critic_value(states=next_states, actions=None, num_samples=config.num_samples)   
+        
         # Compute advantages and returns
         advantages = self.compute_gae(
-            rewards, values, next_values, dones
+            rewards, v_vals, next_values, dones
         )
-        returns = self.td_returns(
-            rewards, next_values, dones, config.k
-        )
+        # returns = self.td_returns(
+        #     rewards, next_values, dones, config.k
+        # )
+        returns = self.calculate_monte_carlo_returns(rewards=rewards,dones=dones, gamma=self.gamma)
+        
+        
         # Store the data for actor and critic training
         self.critic_batch = {'states': states, 'actions': actions}
-        self.critic_returns = returns
         self.advantages = advantages
-        self.critic.return_mean.data = returns.mean()
-        self.critic.return_std.data = returns.std() + 1e-6
+        # self.critic_returns = (returns - self.critic.return_mean) / self.critic.return_std
+        # Update running mean and std using a running average
+        self.critic.return_mean.data = (1 - config.alpha) * self.critic.return_mean.data + config.alpha * returns.mean()
+        self.critic.return_std.data = (1 - config.alpha) * self.critic.return_std.data + config.alpha * returns.std()
+        
+        self.critic_returns = (returns - self.critic.return_mean) / (self.critic.return_std.data + 1e-6)
+    
     
     
     
@@ -852,17 +895,17 @@ class ActorCriticWithFlow(pl.LightningModule):
         self.actor_step_counter += 1
         
         # Log metrics
-        wandb.log({
-            'actor/advantage': advantages.mean().item(),
-            'actor/log_probs': log_probs.mean().item(),
-            'actor/old_log_probs': old_log_probs.mean().item(),
-            'actor/ratio': ratio.mean().item(),
-            'actor/policy_loss': actor_loss.item(),
-            'actor/entropy_loss': entropy_loss.item(),
-            'actor/kl_divergence': kl_div.item(),
-            'actor/step': int(self.actor_step_counter),
-            'actor/clipped_ratio': clipped_ratio.mean().item(),
-        })
+        # wandb.log({
+        #     'actor/advantage': advantages.mean().item(),
+        #     'actor/log_probs': log_probs.mean().item(),
+        #     'actor/old_log_probs': old_log_probs.mean().item(),
+        #     'actor/ratio': ratio.mean().item(),
+        #     'actor/policy_loss': actor_loss.item(),
+        #     'actor/entropy_loss': entropy_loss.item(),
+        #     'actor/kl_divergence': kl_div.item(),
+        #     'actor/step': int(self.actor_step_counter),
+        #     'actor/clipped_ratio': clipped_ratio.mean().item(),
+        # })
         
         # Increment actor step counter
         
@@ -889,27 +932,26 @@ class ActorCriticWithFlow(pl.LightningModule):
             
         # Forward pass through critic
         critic_output = self.critic(critic_states, critic_actions, critic_returns)
-        critic_loss = self.value_loss_coef * critic_output['nll'].mean()
+        critic_loss = critic_output['nll'].mean()
         
-        samples = self.critic(critic_states, critic_actions, return_value=None, num_samples=10, rev=True)['mean']
-        mse_loss = F.mse_loss(samples, critic_returns)
-        critic_loss += mse_loss
+        samples = self.critic(critic_states, critic_actions, return_value=None, num_samples=config.num_samples, rev=True)['mean']
         
-        
+        huber_loss = F.smooth_l1_loss(samples, critic_returns)
+        critic_loss += huber_loss
         # critic_output = self.critic(critic_states, critic_actions)
         # critic_loss = self.value_loss_coef * critic_output.mean()
         
-        wandb.log({
-            'critic/loss': critic_loss.item(),
-            'critic/step': float(self.critic_step_counter),
-            
-            
-            })
+        # wandb.log({
+        #     'critic/loss': critic_loss.item(),
+        #     'critic/step': float(self.critic_step_counter),
+        #     'critic/huber': huber_loss.item(),
+        #     'critic/nll_loss': critic_output['nll'].mean().item()
+        # })
       
         # Increment critic step counter
         self.critic_step_counter += 1
         
-        return critic_loss
+        return critic_loss * self.value_loss_coef
     
     def reset_batch(self):
         """Reset the batch data."""
@@ -951,7 +993,6 @@ class ActorCriticWithFlow(pl.LightningModule):
             If actions is provided: Tuple of (q_values, v_values)
             If actions is None: v_values only
         """
-        batch_size = states.shape[0]
         
         # Case 1: Actions are provided - return both Q(s,a) and V(s)
         if actions is not None:
@@ -962,6 +1003,7 @@ class ActorCriticWithFlow(pl.LightningModule):
                 
                 # Calculate V(s) by sampling actions and averaging
                 v_values = []
+                
                 for _ in range(num_samples):
                     # Sample actions from the current policy
                     sampled_actions, _ = self.actor.get_action(states, deterministic=False)

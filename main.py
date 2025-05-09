@@ -7,16 +7,7 @@ import json
 import os
 
 def main():
-    """
-    Objective function for Optuna to optimize actor_lr and critic_lr
-    based on the average reward.
     
-    Args:
-        trial: An Optuna trial object
-        
-    Returns:
-        float: The average reward achieved with the hyperparameters
-    """
     # Create environment to get state and action dimensions
     env = gym.make(config.env_name)
     state_dim = env.observation_space.shape[0]

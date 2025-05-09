@@ -113,6 +113,8 @@ def train_model(
             at_tensor = model.act(st_tensor, deterministic=False)
         action = at_tensor.cpu().numpy()
         next_state, reward, term, trunc, _ = env.step(action.item())
+        # pos, vel = next_state
+        # reward += 0.1 * abs(vel) + 0.5 * pos
         done = term or trunc
 
         if mode == 'off_policy':

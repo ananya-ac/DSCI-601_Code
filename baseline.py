@@ -1,6 +1,7 @@
-import gym
+import gymnasium as gym
 import matplotlib.pyplot as plt
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, SAC
+import pdb
 from stable_baselines3.common.callbacks import BaseCallback
 
 
@@ -39,7 +40,7 @@ class LivePlotCallback(BaseCallback):
 
 def main():
     # Create the training environment (no rendering)
-    train_env = gym.make("Pendulum-v1")
+    train_env = gym.make("LunarLander-v3")
 
     # Instantiate the PPO model with an MLP policy and tensorboard logging
     model = PPO(
@@ -52,17 +53,16 @@ def main():
     # Train the model with live plotting callback
     live_plot = LivePlotCallback()
     model.learn(
-        total_timesteps=100000,
+        total_timesteps=30000,
         callback=live_plot,
-        tb_log_name='PPO_CartPole'
+        tb_log_name='PPO_LunarLander',
     )
 
     # Save the trained model
-    model.save('ppo_cartpole')
     train_env.close()
 
     # Evaluation environment (with rendering)
-    eval_env = gym.make('Pendulum-v1', render_mode='human')
+    eval_env = gym.make('LunarLander-v3', render_mode='human')
     obs, _info = eval_env.reset()
     for _ in range(1000):
         action, _ = model.predict(obs, deterministic=True)
@@ -75,7 +75,7 @@ def main():
         if done:
             obs, _info = eval_env.reset()
     eval_env.close()
-
+    pdb.set_trace()
 
 if __name__ == '__main__':
     main()
