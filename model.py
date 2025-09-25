@@ -14,6 +14,9 @@ import config
 import copy
 import wandb
 from geomloss import SamplesLoss
+import normflows as nf
+
+
 import pdb
 
 wasserstein_loss = SamplesLoss()
@@ -106,106 +109,54 @@ def build_normalizing_flow(input_dim: int,
     return model
 
 
-def build_normalizing_flow_(input_dim: int,
-                            condition_dim: int,
-                            num_layers: int,
-                            clamp=1.0
-                           ) -> ReversibleGraphNet:
-    """
-    Build a conditional normalizing flow using AllInOneBlock.
-
-    Args:
-        input_dim: Dimension of the flow input (e.g., return embedding).
-        condition_dim: Dimension of the conditioning vector (e.g., state-action encoding).
-        num_layers: Number of AllInOne blocks.
-        subnet_fc: Function defining the subnet MLP.
-        clamp: Clamping value for affine terms in AllInOneBlock.
-
-    Returns:
-        A conditional ReversibleGraphNet.
-    """
-    nodes = [InputNode(input_dim, name='input')]
-    cond_node = ConditionNode(condition_dim, name='condition')
-
-    for k in range(num_layers):
-        # AllInOneBlock (conditionally affine + built-in permutation)
-        nodes.append(Node(
-            nodes[-1],
-            AllInOneBlock,
-            {'subnet_constructor': subnet_fc, 'affine_clamping': clamp},
-            conditions=cond_node,
-            name=f'block_{k}'
-        ))
-
-    nodes.append(OutputNode(nodes[-1], name='output'))
-
-    flow = ReversibleGraphNet(nodes + [cond_node], verbose=False)
-
-    # Initialize weights
-    for p in flow.parameters():
-        if p.dim() > 1:
-            nn.init.xavier_uniform_(p)
-        else:
-            nn.init.zeros_(p)
-
-    return flow
 
 
-# class SelfAttentionEncoder(nn.Module):
-#     """Self-attention based state-action encoder"""
-#     def __init__(self, state_dim:int, action_dim:int, hidden_dim:int, num_heads:int, continuous:bool, num_actions:int):
-#         super().__init__()
-        
-#         # Input embeddings for state and action features
-#         self.state_embedding = nn.Linear(state_dim, hidden_dim)
-        
-#         # Self-attention layer
-#         self.self_attention = nn.MultiheadAttention(
-#             embed_dim=hidden_dim,
-#             num_heads=num_heads,
-#             batch_first=True
-#         )
-        
-#         # Output projection
-#         self.layer_norm = nn.LayerNorm(hidden_dim)
-#         self.output_layer = nn.Sequential(
-#             nn.Linear(hidden_dim, hidden_dim),
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim, hidden_dim)
-#         )
-#         if continuous:
-#             self.action_embedding = nn.Linear(action_dim, hidden_dim)
+
+# def build_normalizing_flow_(input_dim: int,
+#                             condition_dim: int,
+#                             num_layers: int,
+#                             clamp=1.0
+#                            ) -> ReversibleGraphNet:
+#     """
+#     Build a conditional normalizing flow using AllInOneBlock.
+
+#     Args:
+#         input_dim: Dimension of the flow input (e.g., return embedding).
+#         condition_dim: Dimension of the conditioning vector (e.g., state-action encoding).
+#         num_layers: Number of AllInOne blocks.
+#         subnet_fc: Function defining the subnet MLP.
+#         clamp: Clamping value for affine terms in AllInOneBlock.
+
+#     Returns:
+#         A conditional ReversibleGraphNet.
+#     """
+#     nodes = [InputNode(input_dim, name='input')]
+#     cond_node = ConditionNode(condition_dim, name='condition')
+
+#     for k in range(num_layers):
+#         # AllInOneBlock (conditionally affine + built-in permutation)
+#         nodes.append(Node(
+#             nodes[-1],
+#             AllInOneBlock,
+#             {'subnet_constructor': subnet_fc, 'affine_clamping': clamp},
+#             conditions=cond_node,
+#             name=f'block_{k}'
+#         ))
+
+#     nodes.append(OutputNode(nodes[-1], name='output'))
+
+#     flow = ReversibleGraphNet(nodes + [cond_node], verbose=False)
+
+#     # Initialize weights
+#     for p in flow.parameters():
+#         if p.dim() > 1:
+#             nn.init.xavier_uniform_(p)
 #         else:
-#             # Embedding layer for discrete actions
-#             self.action_embedding = nn.Embedding(num_actions, hidden_dim)
-    
-#     def forward(self, state:torch.Tensor, action:torch.Tensor) -> torch.Tensor:
-        
-#         # Ensure action has correct dimensions
-#         # if action.dim() == 1:
-#         #     action = action.unsqueeze(1)
-#         batch_size = state.shape[0]
-#         action = action.view(batch_size, -1)    
-#         # Embed state features
-#         state_emb = self.state_embedding(state).unsqueeze(1)  # [batch_size, 1, hidden_dim]
-#         # Embed action
-#         action_emb = self.action_embedding(action).unsqueeze(1)  # [batch_size, 1, hidden_dim]
-#         # Concatenate state and action embeddings
-#         # This treats them as a set of tokens to apply self-attention 
-#         combined = torch.cat([state_emb, action_emb], dim=1)  # [batch_size, 2, hidden_dim]
-#         # Apply self-attention
-#         attn_output, _ = self.self_attention(combined, combined, combined)
-        
-#         # Apply layer normalization with residual connection
-#         normalized = self.layer_norm(attn_output + combined)
-        
-#         # Pool the attended features (mean pooling)
-#         pooled = torch.mean(normalized, dim=1)  # [batch_size, hidden_dim]
-        
-#         # Final encoding
-#         encoding = self.output_layer(pooled)
-        
-#         return 
+#             nn.init.zeros_(p)
+
+#     return flow
+
+
 
 
 class SimpleEncoder(nn.Module):
@@ -215,6 +166,7 @@ class SimpleEncoder(nn.Module):
         state_dim: int,
         action_dim: int,
         hidden_dim: int,
+        out_dim: int,
         continuous: bool,
         num_actions: int
     ):
@@ -260,14 +212,6 @@ class SimpleEncoder(nn.Module):
         )
         self.continuous = continuous    
 
-    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        # state: (batch, state_dim)
-        # action: (batch, action_dim) if continuous, else (batch,) long tensor
-        s = self.state_embedding(state)
-        a = self.action_embedding(action)
-        x = torch.cat([s, a], dim=-1)
-        x = self.fusion_network(x)
-        return self.output_layer(x)
         
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         batch_size = state.shape[0]
@@ -294,64 +238,28 @@ class SimpleEncoder(nn.Module):
         
         return encoding
 
-# class SimpleEncoder(nn.Module):
-#     def __init__(self, state_dim, hidden_dim):
-#         super().__init__()
-        
-#         self.state_encoder = nn.Sequential(
-#             nn.Linear(state_dim, hidden_dim),
-#             nn.LeakyReLU(),
-#             nn.Linear(hidden_dim, hidden_dim),
-#             nn.LeakyReLU(),
-#             nn.Linear(hidden_dim, hidden_dim)
-#         )
-    
-#     def forward(self, state):
-#         # Encode state only
-#         state_encoding = self.state_encoder(state)
-#         return state_encoding
 
 class ConditionalNormalizingFlow(nn.Module):
     def __init__(self, state_dim:int, action_dim:int, hidden_dim:int, flow_dim:int, num_layers:int, 
-                 learning_rate:float, normalize_returns:bool, continuous:bool, num_actions:int, num_heads:int):
+                 learning_rate:float, normalize_returns:bool, continuous:bool, num_actions:int):
         super().__init__()
         
         self.state_action_encoder = SimpleEncoder(
             state_dim=state_dim,
             action_dim=action_dim,
             hidden_dim=hidden_dim,
+            out_dim=flow_dim,
             continuous=continuous,
             num_actions=num_actions
         )
         
-        # Return projection layers
         
-        self.return_proj = nn.Sequential(
-            nn.Linear(1, 32),
-            nn.LayerNorm(32),
-            nn.ReLU(),
-            nn.Linear(32, 64),
-            nn.LayerNorm(64),
-            nn.ReLU(),
-            nn.Linear(64, flow_dim),
-            nn.LayerNorm(flow_dim)
-        )
-
-        #self.return_proj = nn.Linear(1, flow_dim)
-        #self.inv_return_proj = nn.Linear(flow_dim, 1)
-        self.inv_return_proj = nn.Sequential(
-            nn.Linear(flow_dim, 64),
-            nn.LayerNorm(64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.LayerNorm(32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
+        
+        
 
         
         # Build the normalizing flow with explicit conditioning
-        self.flow = build_normalizing_flow_(flow_dim, hidden_dim, num_layers)
+        self.flow = build_normalizing_flow(flow_dim, hidden_dim, num_layers)
         
         self.flow_dim = flow_dim
         self.hidden_dim = hidden_dim
@@ -387,17 +295,18 @@ class ConditionalNormalizingFlow(nn.Module):
             #wandb.log({"return_value:" : return_value[0].item()})
             
             if return_value is None:
-                raise ValueError("Return value must be provided for forward pass in the forward direction")
+                raise ValueError("Return value must be provided for pass in the forward direction")
             # if self.normalize_returns:
             #     return_value = (return_value - self.return_mean) / self.return_std
-            # Project return to flow dimension
-            return_emb = self.return_proj(return_value)
+            zeros = torch.randn(batch_size, self.flow_dim - 1, device=state.device) * config.zero_scale # 1 is for return dim
+            return_padded = torch.cat([return_value, zeros], dim=-1)
             # Forward through the flow with explicit conditioning
-            z, log_det_J = self.flow(return_emb, c=encoding, rev=False, jac=True)
             
             
-            corr = torch.corrcoef(z.T)  # shape [flow_dim, flow_dim]
-  
+            z, log_det_J = self.flow(return_padded, c=encoding, rev=False, jac=True)
+            
+            
+            
             
             return {
                 'z': z,
@@ -417,9 +326,7 @@ class ConditionalNormalizingFlow(nn.Module):
             # Transform through the flow in reverse with explicit conditioning
             samples_emb, _ = self.flow(z, c=encoding, rev=True, jac=False)
             
-            # Project back to scalar returns
-            samples = self.inv_return_proj(samples_emb)
-            
+            samples = samples_emb[:, 0:1]  # First dimension corresponds to return
             if self.normalize_returns:
                 samples = samples * self.return_std + self.return_mean
             #Reshape to [batch_size, num_samples]
@@ -502,7 +409,7 @@ class ActorNetwork(nn.Module):
         if self.continuous:
             mean, std = self(state)
             if deterministic:
-                return torch.tanh(mean) * 2.0, None
+                return torch.tanh(mean), None
             
             dist       = Normal(mean, std)
             raw_action = dist.rsample()                              # reparameterized sample
@@ -512,7 +419,7 @@ class ActorNetwork(nn.Module):
             # Jacobian correction term: log |d(tanh)/d(raw_action)| = -log(1 - tanh^2)
             logp      -= torch.log(1 - action.pow(2) + 1e-6).sum(-1, keepdim=True)
             
-            scaled     = action * 2.0
+            scaled     = action
             return scaled, logp
         
         else:
@@ -525,518 +432,6 @@ class ActorNetwork(nn.Module):
             logp   = dist.log_prob(action.squeeze(-1)).unsqueeze(-1)
             return action, logp
 
-
-class ActorCriticWithFlow(pl.LightningModule):
-    """
-    Actor-Critic model using a ConditionalNormalizingFlow as the critic.
-    """
-    def __init__(
-        self, 
-        state_dim, 
-        action_dim, 
-        hidden_dim,
-        flow_dim,
-        num_flow_layers,
-        actor_lr,
-        critic_lr,
-        gamma,
-        continuous,
-        gae_lambda,
-        entropy_coef,
-        value_loss_coef,
-        max_grad_norm,
-        normalize_advantages,
-        num_heads,
-        critic_updates_per_actor_update,
-        num_actions
-        
-    ):
-        super().__init__()
-        self.save_hyperparameters()
-        
-        # Actor network
-        self.actor = ActorNetwork(state_dim, action_dim, hidden_dim, continuous)
-        
-        # Critic network (ConditionalNormalizingFlow)
-        self.critic = ConditionalNormalizingFlow(
-            state_dim=state_dim,
-            action_dim=action_dim,  # For discrete actions, action is just an index
-            hidden_dim=hidden_dim,
-            flow_dim=flow_dim,
-            num_layers=num_flow_layers,
-            learning_rate=critic_lr,
-            normalize_returns=normalize_advantages,
-            num_heads=num_heads,
-            continuous=continuous,
-            num_actions=num_actions
-        )
-        
-        #self.critic = MLPCritic(state_dim, action_dim, hidden_dim, continuous)
-        
-        # Hyperparameters
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        self.entropy_coef = entropy_coef
-        self.value_loss_coef = value_loss_coef
-        self.max_grad_norm = max_grad_norm
-        self.normalize_advantages = normalize_advantages
-        self.actor_lr = actor_lr
-        self.critic_lr = critic_lr
-        self.continuous = continuous
-        self.automatic_optimization = False
-        self.critic_updates_per_actor_update = critic_updates_per_actor_update
-        self.update_counter = 0
-        self._old_synced = False   
-        self.critic_batch = None
-        self.critic_returns = None
-        self.advantages = None
-        
-        self.old_actor = copy.deepcopy(self.actor)
-
-        
-        
-    
-    def compute_gae(self, rewards, values, next_values, dones):
-        """
-        Compute Generalized Advantage Estimation.
-        """
-        
-        if rewards.dim() > 2:
-            rewards = rewards.squeeze(-1)
-            dones = dones.squeeze(-1)
-        deltas = rewards + self.gamma * next_values * (1 - dones) - values
-        advantages = torch.zeros_like(rewards)
-        
-        
-        gae = 0
-        for t in reversed(range(len(rewards))):
-            
-            gae = deltas[t] + self.gamma * self.gae_lambda * (1 - dones[t]) * gae
-            advantages[t] = gae
-            if dones[t]:
-                gae = 0
-            
-        
-        # Normalize advantages
-        if self.normalize_advantages and len(advantages) > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-            
-        return advantages
-    
-    
-    
-    def compute_temporal_difference_return(self, rewards, next_values, dones, k):
-        
-        done_indices = torch.where(dones[:k] == 1)[0]
-    
-        if len(done_indices) == 0:
-            # No terminations in first k steps
-            effective_k = k
-            terminated = False
-        else:
-            # Include the done-step reward
-            effective_k = done_indices[0] + 1
-            terminated = True
-        
-        # Compute discounted sum of rewards
-        gammas = torch.pow(self.gamma, torch.arange(effective_k, device=rewards.device))
-        td_return = torch.sum(gammas * rewards[:effective_k])
-        # Add bootstrap value if we didn't terminate within k steps
-        if not terminated and k < len(next_values):
-            td_return += ((self.gamma ** effective_k) * next_values[effective_k - 1]).item()
-        
-        return td_return
-
-    def td_returns(self, rewards, next_values, dones, k):
-        """
-        Compute Temporal Difference returns.
-        """
-        returns = torch.zeros_like(rewards)
-        for t in range(len(rewards)):
-            returns[t] = self.compute_temporal_difference_return(rewards[t:], next_values[t:], dones[t:], k)
-        return returns  
-    
-    def on_train_start(self):
-        # Initialize step counters
-        self.critic_step_counter = 0
-        self.actor_step_counter = 0
-        
-    
-    
-    def calculate_monte_carlo_returns(self, rewards: torch.Tensor, dones: torch.Tensor, gamma: float = None) -> torch.Tensor:
-        """
-        Compute Monte Carlo returns for a batch of trajectories.
-        
-        Args:
-            rewards: Tensor of shape [batch_size, trajectory_len] — reward sequences.
-            dones: Tensor of shape [batch_size, trajectory_len] — done flags (1 if terminal).
-            gamma: Discount factor. If None, uses self.gamma.
-        
-        Returns:
-            returns: Tensor of shape [batch_size, trajectory_len] — MC returns from each time step.
-        """
-        if gamma is None:
-            gamma = self.gamma
-
-        batch_size, T = rewards.shape
-        returns = torch.zeros_like(rewards)
-
-        for b in range(batch_size):
-            G = 0
-            for t in reversed(range(T)):
-                if dones[b, t]:
-                    G = 0  # reset on terminal state
-                G = rewards[b, t] + gamma * G
-                returns[b, t] = G
-
-        return returns      
-            
-        
-    def training_step(self, batch, batch_idx):
-        # Get optimizers
-    
-        actor_optimizer, critic_optimizer = self.optimizers()
-        
-        # Unpack the batch
-        states, actions, advantages, returns = batch
-        
-        
-        # Store the current batch data
-        self.advantages = advantages
-        self.critic_returns = returns
-        self.critic_batch = {'states': states, 'actions': actions}
-        
-        # Always update critic
-        critic_optimizer.zero_grad()
-        critic_loss = self._critic_training_step() 
-        self.manual_backward(critic_loss)
-        self.clip_gradients(critic_optimizer, gradient_clip_val=config.max_grad_norm, gradient_clip_algorithm="norm")
-        for name, p in self.critic.named_parameters():
-            if (p.grad is None or torch.all(p.grad == 0)) and p.requires_grad:
-                print(f"{name} has no gradient")
-        
-        critic_optimizer.step()
-        
-        
-        # Update actor less frequently
-        update_actor = (self.update_counter % self.critic_updates_per_actor_update == 0)
-        
-        if update_actor:
-            if not self._old_synced:
-                self.old_actor.load_state_dict(self.actor.state_dict())
-                self._old_synced = True
-            
-            actor_optimizer.zero_grad()
-            actor_loss = self._actor_training_step()
-            self.manual_backward(actor_loss)
-            self.clip_gradients(actor_optimizer, gradient_clip_val=config.max_grad_norm, gradient_clip_algorithm="norm")
-            actor_optimizer.step()
-            
-        
-        # Increment update counter
-        self.update_counter += 1    
-    
-    def on_train_epoch_end(self):
-        # called once at the end of the epoch — now clear the flag
-        self._old_synced = False
-
-    
-    def prepare_training_data(self, batch):
-        """Prepare training data for both actor and critic."""
-        states = batch['states']
-        actions = batch['actions']
-        rewards = batch['rewards']
-        dones = batch['dones']
-        next_states = batch['next_states']
-        if states.dim() > 2:
-            states = states.squeeze(-1)
-            
-        if actions.dim() > 2:
-            actions = actions.squeeze(-1)
-        if rewards.dim() > 2:
-            rewards = rewards.squeeze(-1)
-        if dones.dim() > 2:
-            dones = dones.squeeze(-1)
-        if next_states.dim() > 2:
-            next_states = next_states.squeeze(-1)
-        states = states.to(self.device)
-        actions = actions.to(self.device)
-        rewards = rewards.to(self.device)
-        dones = dones.to(self.device)
-        next_states = next_states.to(self.device)
-        
-        
-        # Get current values
-        q_vals, v_vals = self.get_critic_value(states=states, actions=actions)
-    
-        # Get next state values (average over multiple sampled actions)
-        next_values = self.get_critic_value(states=next_states, actions=None, num_samples=config.num_samples)   
-        
-        # Compute advantages and returns
-        advantages = self.compute_gae(
-            rewards, v_vals, next_values, dones
-        )
-        # returns = self.td_returns(
-        #     rewards, next_values, dones, config.k
-        # )
-        returns = self.calculate_monte_carlo_returns(rewards=rewards,dones=dones, gamma=self.gamma)
-        
-        
-        # Store the data for actor and critic training
-        self.critic_batch = {'states': states, 'actions': actions}
-        self.advantages = advantages
-        # self.critic_returns = (returns - self.critic.return_mean) / self.critic.return_std
-        # Update running mean and std using a running average
-        self.critic.return_mean.data = (1 - config.alpha) * self.critic.return_mean.data + config.alpha * returns.mean()
-        self.critic.return_std.data = (1 - config.alpha) * self.critic.return_std.data + config.alpha * returns.std()
-        
-        self.critic_returns = (returns - self.critic.return_mean) / (self.critic.return_std.data + 1e-6)
-    
-    
-    
-    
-    def _actor_training_step(self):
-        """Train the actor using PPO-style trust region optimization."""
-        flat_states = self.critic_batch['states']
-        flat_actions = self.critic_batch['actions']
-        advantages = self.advantages
-        
-            
-        # Compute old log probabilities using the old policy network
-        with torch.no_grad():
-            if self.continuous:
-                old_mean, old_std = self.old_actor(flat_states)
-                old_dist = Normal(old_mean, old_std)
-                
-                # Convert bounded actions back to raw actions
-                tanh_a     = flat_actions / 2.0
-                raw_actions = torch.atanh(tanh_a.clamp(-0.99999, 0.99999))
-                
-                # Calculate log probability of raw actions
-                old_log_probs = old_dist.log_prob(raw_actions).sum(dim=-1, keepdim=True)
-                
-                # Apply correction for the change of variables (tanh transformation)
-                old_log_probs -= torch.log(1 - torch.tanh(raw_actions).pow(2) + 1e-6).sum(dim=-1, keepdim=True)
-            else:
-                old_logits = self.old_actor(flat_states)
-                old_dist = Categorical(logits=old_logits)
-                old_log_probs = old_dist.log_prob(flat_actions.squeeze(-1)).unsqueeze(-1)
-                
-            # Store raw actions for reuse in the next steps
-            if self.continuous:
-                self.raw_actions = raw_actions
-        
-        # Get current policy distribution and log probabilities
-        if self.continuous:
-            action_mean, action_std = self.actor(flat_states)
-            dist = Normal(action_mean, action_std)
-            
-            # Use the previously computed raw actions
-            log_probs = dist.log_prob(self.raw_actions).sum(dim=-1, keepdim=True)
-            
-            # Apply correction for the change of variables (tanh transformation)
-            tanh_actions = flat_actions / 2.0  # Scale back to [-1, 1]
-            log_probs -= torch.log(1 - tanh_actions.pow(2) + 1e-6).sum(dim=-1, keepdim=True)
-            
-            # Calculate entropy for exploration bonus
-            entropy = dist.entropy().sum(dim=-1, keepdim=True)
-            
-            # Calculate KL divergence for monitoring
-            with torch.no_grad():
-                old_mean, old_std = self.old_actor(flat_states)
-                kl_div = torch.mean(
-                    torch.sum(
-                        0.5 * ((action_mean - old_mean) / old_std)**2 + 
-                        0.5 * (action_std**2 / old_std**2) - 
-                        0.5 - 
-                        torch.log(action_std / old_std),
-                        dim=-1
-                    )
-                )
-        else:
-            action_logits = self.actor(flat_states)
-            dist = Categorical(logits=action_logits)
-            log_probs = dist.log_prob(flat_actions.squeeze(-1)).unsqueeze(-1)
-            entropy = dist.entropy().unsqueeze(-1)
-            
-            # Calculate KL divergence
-            with torch.no_grad():
-                old_logits = self.old_actor(flat_states)
-                kl_div = torch.mean(
-                    torch.sum(
-                        F.softmax(old_logits, dim=-1) * 
-                        (F.log_softmax(old_logits, dim=-1) - F.log_softmax(action_logits, dim=-1)),
-                        dim=-1
-                    )
-                )
-        
-        # Clamp the log probabilities to avoid numerical issues
-        old_log_probs = torch.clamp(old_log_probs, min=-10, max=10)
-        log_probs = torch.clamp(log_probs, min=-10, max=10)
-        # Compute probability ratio between new and old policies
-        ratio = torch.exp(log_probs - old_log_probs)
-        
-        # Clamp the ratio for PPO-style trust region
-        clipped_ratio = torch.clamp(ratio, 1.0 - config.epsilon, 1.0 + config.epsilon)
-        
-        # Compute surrogate objectives
-        surr1 = ratio * advantages
-        surr2 = clipped_ratio * advantages
-        
-        # Take the minimum to implement the pessimistic bound
-        actor_loss = -torch.min(surr1, surr2).mean()
-        
-        # Calculate entropy loss (encourage exploration)
-        entropy_loss = -self.entropy_coef * entropy.mean()
-        
-        # Combine losses
-        total_actor_loss = actor_loss + entropy_loss + kl_div
-        
-        self.actor_step_counter += 1
-        
-        # Log metrics
-        # wandb.log({
-        #     'actor/advantage': advantages.mean().item(),
-        #     'actor/log_probs': log_probs.mean().item(),
-        #     'actor/old_log_probs': old_log_probs.mean().item(),
-        #     'actor/ratio': ratio.mean().item(),
-        #     'actor/policy_loss': actor_loss.item(),
-        #     'actor/entropy_loss': entropy_loss.item(),
-        #     'actor/kl_divergence': kl_div.item(),
-        #     'actor/step': int(self.actor_step_counter),
-        #     'actor/clipped_ratio': clipped_ratio.mean().item(),
-        # })
-        
-        # Increment actor step counter
-        
-            
-        return total_actor_loss
-        
-    def _critic_training_step(self):
-        """Train the critic using the returns."""
-        flat_states = self.critic_batch['states']
-        flat_actions = self.critic_batch['actions']
-        returns = self.critic_returns
-        
-        
-        # Sample a subset of the batch for critic update if batch_size is specified
-        if hasattr(self.hparams, 'critic_batch_size') and self.hparams.critic_batch_size and self.hparams.critic_batch_size < len(flat_states):
-            indices = torch.randperm(len(flat_states))[:self.hparams.critic_batch_size]
-            critic_states = flat_states[indices]
-            critic_actions = flat_actions[indices]
-            critic_returns = returns[indices]
-        else:
-            critic_states = flat_states
-            critic_actions = flat_actions
-            critic_returns = returns
-            
-        # Forward pass through critic
-        critic_output = self.critic(critic_states, critic_actions, critic_returns)
-        critic_loss = critic_output['nll'].mean()
-        
-        samples = self.critic(critic_states, critic_actions, return_value=None, num_samples=config.num_samples, rev=True)['mean']
-        
-        huber_loss = F.smooth_l1_loss(samples, critic_returns)
-        critic_loss += huber_loss
-        # critic_output = self.critic(critic_states, critic_actions)
-        # critic_loss = self.value_loss_coef * critic_output.mean()
-        
-        # wandb.log({
-        #     'critic/loss': critic_loss.item(),
-        #     'critic/step': float(self.critic_step_counter),
-        #     'critic/huber': huber_loss.item(),
-        #     'critic/nll_loss': critic_output['nll'].mean().item()
-        # })
-      
-        # Increment critic step counter
-        self.critic_step_counter += 1
-        
-        return critic_loss * self.value_loss_coef
-    
-    def reset_batch(self):
-        """Reset the batch data."""
-        self.critic_batch = None
-        self.critic_returns = None
-        self.advantages = None
-    
-    
-    
-    def configure_optimizers(self):
-        """
-        Configure separate optimizers for actor and critic with custom frequency.
-        """
-        actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=self.actor_lr, betas = config.betas, eps = config.eps)
-        
-        critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=self.critic_lr, betas=config.betas, eps=config.eps)
-
-        
-        # Return optimizers with a frequency dictionaries to control how often they're used
-        # The actor optimizer will be called once every `critic_updates_per_step + 1` calls
-        # The critic optimizer will be called `critic_updates_per_step` times for every actor update
-        return [
-            {"optimizer": actor_optimizer},
-            {"optimizer": critic_optimizer}
-        ]
-        
-        
-    def get_critic_value(self, states, actions=None, num_samples=20):
-        """
-        Get value estimates from the state-action conditioned critic.
-        
-        Args:
-            states: Tensor of states [batch_size, state_dim]
-            actions: Optional tensor of actions [batch_size, action_dim]. 
-                    If None, will sample actions from the current policy.
-            num_samples: Number of action samples to use for averaging when actions aren't provided
-                        
-        Returns:
-            If actions is provided: Tuple of (q_values, v_values)
-            If actions is None: v_values only
-        """
-        
-        # Case 1: Actions are provided - return both Q(s,a) and V(s)
-        if actions is not None:
-            with torch.no_grad():
-                # Calculate Q(s,a) for the provided actions
-                output = self.critic(states, actions, rev=True, return_value=None, num_samples=config.num_samples)
-                q_values = output['mean']
-                
-                # Calculate V(s) by sampling actions and averaging
-                v_values = []
-                
-                for _ in range(num_samples):
-                    # Sample actions from the current policy
-                    sampled_actions, _ = self.actor.get_action(states, deterministic=False)
-                    output = self.critic(states, sampled_actions, rev=True, return_value=None, num_samples=config.num_samples)
-                    v_values.append(output['mean'])
-                
-                # Average over all sampled actions to get V(s)
-                v_values = torch.stack(v_values, dim=0).mean(dim=0)
-                
-                return q_values, v_values
-        
-        # Case 2: Actions not provided - compute V(s) only
-        else:
-            all_values = []
-            with torch.no_grad():
-                for _ in range(num_samples):
-                    # Sample actions from the current policy
-                    sampled_actions, _ = self.actor.get_action(states, deterministic=False)
-                    output = self.critic(states, sampled_actions, rev=True, return_value=None, num_samples=config.num_samples)
-                    all_values.append(output['mean'])
-                
-                # Average over all sampled actions
-                v_values = torch.stack(all_values, dim=0).mean(dim=0)
-                
-            return v_values
-        
-    def act(self, state, deterministic=False):
-        """
-        Select an action given a state.
-        """
-        with torch.no_grad():
-            action, _ = self.actor.get_action(state, deterministic)
-            return action
 
 
 
@@ -1099,3 +494,206 @@ class MLPCritic(nn.Module):
         value = self.value_network(combined)
         
         return value
+    
+    
+    
+class FlowQCritic(torch.nn.Module):
+    """
+    Wraps ConditionalNormalizingFlow to behave like a scalar Q(s,a) estimator.
+    We train it to match scalar targets y (SAC TD targets) and use its
+    reverse pass mean as the Q estimate.
+    """
+    def __init__(self, state_dim, action_dim, hidden_dim, flow_dim, num_layers,
+                 lr, normalize_returns, continuous, num_actions):
+        super().__init__()
+        self.flow = ConditionalNormalizingFlow(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden_dim=hidden_dim,
+            flow_dim=flow_dim,
+            num_layers=num_layers,
+            learning_rate=lr,
+            normalize_returns=normalize_returns,
+            continuous=continuous,
+            num_actions=num_actions
+        )
+
+    @torch.no_grad()
+    def q_value(self, states, actions, num_samples=20):
+        # Use the mean of the learned return/value distribution as Q estimate
+        out = self.flow(states, actions, return_value=None, num_samples=num_samples, rev=True)
+        return out['mean']  # [B,1]
+
+    def nll_to_targets(self, states, actions, targets):
+        """
+        Likelihood term that pulls the flow toward scalar targets.
+        """
+        out = self.flow(states, actions, return_value=targets, rev=False)
+        return out['nll']  # [B]
+
+    def huber_to_targets(self, states, actions, targets, num_samples=20):
+        with torch.no_grad():
+            mean_pred = self.q_value(states, actions, num_samples=num_samples)
+        return F.smooth_l1_loss(mean_pred, targets)
+
+class TwinFlowCritic(torch.nn.Module):
+    """
+    Standard SAC twin Q critics, but each Q is a flow-based critic.
+    """
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.q1 = FlowQCritic(**kwargs)
+        self.q2 = FlowQCritic(**kwargs)
+
+    @torch.no_grad()
+    def q_values(self, states, actions, num_samples=20):
+        return self.q1.q_value(states, actions, num_samples), self.q2.q_value(states, actions, num_samples)
+
+
+# --- NEW: Conditional NSFs with optional Metropolis–Hastings blocks ---
+import importlib
+
+class ConditionalNSF(nn.Module):
+    """
+    Conditional value-distribution critic built with normflows:
+      - Neural Spline Flows (Rational Quadratic)
+      - Optional stochastic Metropolis–Hastings blocks
+    Matches the API of ConditionalNormalizingFlow for easy swapping.
+    """
+    def __init__(self,
+                 state_dim:int, action_dim:int, hidden_dim:int,
+                 flow_dim:int,               # dimension of the 'flow vector' (first coord is return)
+                 num_layers:int,
+                 learning_rate:float,
+                 normalize_returns:bool,
+                 continuous:bool,
+                 num_actions:int,
+                 *,
+                 nsf_kind:str = "autoregressive",  # "coupling" or "autoregressive"
+                 nsf_hidden_units:int = 64,
+                 nsf_hidden_layers:int = 2,
+                 nsf_num_bins:int = 6,
+                 mh_every_k:int = 0,  
+                 tail_bound = 6,# 0 => no MH; otherwise insert MH after every k flow blocks
+                 base_trainable:bool = False):
+        super().__init__()
+
+        # Reuse your (s,a)->context encoder
+        self.state_action_encoder = SimpleEncoder(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden_dim=hidden_dim,
+            out_dim=hidden_dim,
+            continuous=continuous,
+            num_actions=num_actions
+        )
+
+        
+        self.flow_dim       = flow_dim
+        self.hidden_dim     = hidden_dim
+        self.learning_rate  = learning_rate
+        self.state_dim      = state_dim
+        self.action_dim     = action_dim
+        self.normalize_returns = normalize_returns
+        self.return_mean    = nn.Parameter(torch.zeros(1), requires_grad=False)
+        self.return_std     = nn.Parameter(torch.ones(1),  requires_grad=False)
+
+        # --- Build conditional NSF chain ---
+        flows = []
+        for i in range(num_layers):
+            if nsf_kind.lower().startswith("auto"):
+                # Autoregressive NSF (conditional)
+                flows += [nf.flows.AutoregressiveRationalQuadraticSpline(
+                    in_channels=flow_dim,
+                    hidden_layers=nsf_hidden_layers,
+                    hidden_units=nsf_hidden_units,
+                    num_bins=nsf_num_bins,
+                    num_context_channels=hidden_dim,
+                    tail_bound=tail_bound
+                    
+                )]
+            else:
+                # Coupling NSF (conditional)
+                flows += [nf.flows.CoupledRationalQuadraticSpline(
+                    num_input_channels=flow_dim,
+                    num_blocks=nsf_hidden_layers,
+                    num_hidden_channels=nsf_hidden_units,
+                    num_bins=nsf_num_bins,
+                    num_context_channels=hidden_dim,
+                    tail_bound=tail_bound   
+                )]
+
+            # learned linear permutation (like 1x1 conv / LU)
+            flows += [nf.flows.LULinearPermute(flow_dim)]
+
+            # Optional: insert a stochastic MH block every k layers
+            if mh_every_k > 0 and (i + 1) % mh_every_k == 0:
+                # Some installations expose this as nf.flows.MetropolisHastings
+                # If unavailable, this will raise with a clear message.
+                if hasattr(nf.flows, "MetropolisHastings"):
+                    flows += [nf.flows.MetropolisHastings()]
+                else:
+                    raise AttributeError(
+                        "normflows: MetropolisHastings block not found. "
+                        "Update normflows to a version with stochastic flow blocks."
+                    )
+
+        # Base distribution (diagonal Gaussian over 'flow_dim')
+        q0 = nf.distributions.DiagGaussian(flow_dim, trainable=base_trainable)
+
+        # We don’t know the environment’s true target density, so we use a conditional flow model
+        # without a target distribution and train via forward KLD / NLL on observed returns.
+        self.nf = nf.ConditionalNormalizingFlow(q0=q0, flows=flows)
+
+    def _pad_return(self, return_value: torch.Tensor, device):
+        """Pad the scalar return with noise for the remaining (flow_dim-1) coords."""
+        b = return_value.shape[0]
+        zeros = torch.randn(b, self.flow_dim - 1, device=device) * config.zero_scale
+        return torch.cat([return_value, zeros], dim=-1)
+
+    def forward(self, state, action, return_value=None, num_samples=None, rev:bool=False):
+        """
+        If rev=False: compute NLL(z) of the observed return under q(r | s,a).
+        If rev=True : sample num_samples returns for each (s,a).
+        """
+        device = state.device
+        context = self.state_action_encoder(state, action)  # [B, hidden_dim]
+
+        if not rev:
+            if return_value is None:
+                raise ValueError("Provide return_value when rev=False")
+            # (Optional) normalize observed returns
+            # if self.normalize_returns:
+            #     return_value = (return_value - self.return_mean) / self.return_std
+
+            x = self._pad_return(return_value, device)
+            # normflows uses 'log_prob(x, context)'
+            logp = self.nf.log_prob(x, context)
+            nll = -logp.mean()
+            # For parity with your FrEIA version, return a dict with 'nll'
+            return {'z': None, 'log_det_J': None, 'nll': nll}
+        else:
+            if num_samples is None or num_samples < 1:
+                raise ValueError("num_samples must be >= 1 when rev=True")
+
+            B = state.shape[0]
+            # Repeat context B*num_samples and sample from conditional flow, then keep the first coord (return)
+            context_rep = context.repeat_interleave(num_samples, dim=0)  # [B*num_samples, hidden_dim]
+            ###x_samples = self.nf.sample(B * num_samples, context=context_rep)  # [B*num_samples, flow_dim]
+            
+            x_samples, _ = self.nf.sample(B * num_samples, context=context_rep)  # [B*num_samples, flow_dim]
+            
+            returns = x_samples[:, :1].view(B, num_samples)
+
+            if self.normalize_returns:
+                returns = returns * self.return_std + self.return_mean
+
+            return {
+                'samples': returns,
+                'mean': returns.mean(dim=1, keepdim=True),
+                'std':  returns.std(dim=1, keepdim=True)
+            }
+
+    @torch.no_grad()
+    def sample_value_distribution(self, state, action, num_samples:int):
+        return self(state, action, num_samples=num_samples, rev=True)
