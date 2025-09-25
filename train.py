@@ -1,22 +1,24 @@
-import gymnasium as gym
-import torch
-import numpy as np
-from collections import deque
-import pytorch_lightning as pl
-from lightning.pytorch.loggers import WandbLogger
-from tqdm import tqdm
-import random
-from torch.utils.data import TensorDataset, DataLoader
-from model import ActorCriticWithFlow
 import os
-import wandb
-import config
-from stable_baselines3.common.buffers import ReplayBuffer
+import random
+from collections import deque
 
-def save_model_on_best_reward(model, recent_rewards, best_avg_reward, checkpoint_dir="./checkpoints/"):
+import gymnasium as gym
+import numpy as np
+import pytorch_lightning as pl
+import torch
+from stable_baselines3.common.buffers import ReplayBuffer
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
+
+import config
+from agent import ActorCriticWithFlow, SACWithFlow
+import wandb
+
+
+def _save_model_on_best_reward(model, recent_rewards, best_avg_reward, checkpoint_dir="./checkpoints/"):
     if not recent_rewards:
         return best_avg_reward
-    current_avg = np.mean(recent_rewards)
+    current_avg = float(np.mean(recent_rewards))
     if current_avg > best_avg_reward:
         os.makedirs(checkpoint_dir, exist_ok=True)
         path = os.path.join(checkpoint_dir, "best_model_reward.ckpt")
@@ -25,6 +27,10 @@ def save_model_on_best_reward(model, recent_rewards, best_avg_reward, checkpoint
         return current_avg
     return best_avg_reward
 
+
+def _is_continuous(space):
+    return space.dtype.name != "int64"
+    
 
 def train_model(
     env_name,
@@ -36,7 +42,7 @@ def train_model(
     actor_lr,
     critic_lr,
     gamma,
-    continuous,
+    continuous,                   # kept for signature compatibility; env decides
     gae_lambda,
     entropy_coef,
     value_loss_coef,
@@ -55,22 +61,106 @@ def train_model(
     normalize_advantages,
     critic_updates_per_actor_update,
     seed,
-    mode='on_policy',  # 'on_policy' or 'off_policy'
-    replay_buffer_size=100_000,
+    replay_buffer_size=100_000,   # off-policy (SAC)
+    tau=0.005,                    # SAC target smoothing
+    alpha_lr=3e-4,                # SAC temperature lr
 ):
-    # seeds
+    # -----------------------
+    # Seeding & Env
+    # -----------------------
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
 
     env = gym.make(env_name)
     if max_episode_steps:
-        env._max_episode_steps = max_episode_steps
-    num_actions = env.action_space.n if not continuous else env.action_space.shape[0]
+        try:
+            env._max_episode_steps = max_episode_steps
+        except Exception:
+            pass
 
-    # buffer for off-policy
-    buffer = None
-    if mode == 'off_policy':
+    # Decide strictly from env
+    is_cont = _is_continuous(env.action_space)
+    if is_cont:
+        action_dim = env.action_space.shape[0]
+        num_actions = 0
+        algo = "sac"               # continuous -> off-policy SAC
+        mode = "off_policy"
+    else:
+        num_actions = env.action_space.n
+        action_dim = 1             # not used in PPO path
+        algo = "ppo_flow"          # discrete -> on-policy ActorCriticWithFlow
+        mode = "on_policy"
+
+    # -----------------------
+    # Instantiate model (NO helper)
+    # -----------------------
+    if algo == "sac":
+        model = SACWithFlow(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden_dim=hidden_dim,
+            flow_dim=flow_dim,
+            num_flow_layers=num_flow_layers,
+            actor_lr=actor_lr,
+            critic_lr=critic_lr,
+            alpha_lr=alpha_lr,
+            gamma=gamma,
+            tau=tau,
+            continuous=True,     # enforced for SAC
+            num_actions=0,       # unused in continuous path
+            target_entropy=None, # defaults to -|A|
+            normalize_returns=True,
+        )
+    else:
+        model = ActorCriticWithFlow(
+            state_dim=state_dim,
+            action_dim=num_actions,   # discrete branch uses num_actions
+            hidden_dim=hidden_dim,
+            flow_dim=flow_dim,
+            num_flow_layers=num_flow_layers,
+            actor_lr=actor_lr,
+            critic_lr=critic_lr,
+            gamma=gamma,
+            continuous=False,         # enforced for PPO path
+            gae_lambda=gae_lambda,
+            entropy_coef=entropy_coef,
+            value_loss_coef=value_loss_coef,
+            max_grad_norm=max_grad_norm,
+            normalize_advantages=normalize_advantages,
+            critic_updates_per_actor_update=critic_updates_per_actor_update,
+            num_actions=num_actions,
+        )
+
+    # -----------------------
+    # Logging
+    # -----------------------
+    wandb.init(project="dist_rl_online")
+    wandb.config.update({
+        "env": env_name,
+        "algo": algo,
+        "mode": mode,
+        "seed": seed,
+        "hidden_dim": hidden_dim,
+        "flow_dim": flow_dim,
+        "num_flow_layers": num_flow_layers,
+        "actor_lr": actor_lr,
+        "critic_lr": critic_lr,
+        "gamma": gamma,
+        "tau": tau,
+        "alpha_lr": alpha_lr,
+        "update_frequency": update_frequency,
+        "critic_batch_size": critic_batch_size,
+    })
+
+    best_avg = float("-inf")
+    recent_rewards = deque(maxlen=100)
+
+    # Storage
+    if mode == "on_policy":
+        roll_states, roll_actions, roll_rewards, roll_dones, roll_next = [], [], [], [], []
+        buffer = None
+    else:
         buffer = ReplayBuffer(
             buffer_size=replay_buffer_size,
             observation_space=env.observation_space,
@@ -78,120 +168,123 @@ def train_model(
             device=config.device,
         )
 
-    model = ActorCriticWithFlow(
-        state_dim, action_dim, hidden_dim,
-        flow_dim, num_flow_layers,
-        actor_lr, critic_lr,
-        gamma, continuous,
-        gae_lambda, entropy_coef,
-        value_loss_coef, max_grad_norm,
-        normalize_advantages, num_heads,
-        critic_updates_per_actor_update,
-        num_actions
-    )
-
-    # wandb
-    wandb.init(project='dist_rl_online')
-    wandb.config.update(locals())
-    best_avg = float('-inf')
-    recent_rewards = deque(maxlen=100)
-
-    # on-policy storage
-    if mode == 'on_policy':
-        states, actions, rewards, dones, next_states = [], [], [], [], []
-
+    # -----------------------
+    # Loop
+    # -----------------------
     state, _ = env.reset(seed=seed)
-    episode_reward = 0
+    episode_reward = 0.0
     episodes_completed = 0
     timestep = 0
-    pbar = tqdm(total=total_timesteps, desc="Training")
+    pbar = tqdm(total=total_timesteps, desc=f"Training ({algo})")
+
+    model = model.to(config.device)
 
     while timestep < total_timesteps:
-        model = model.to(config.device)
-        st_tensor = torch.FloatTensor(state).to(config.device)
+        st = torch.as_tensor(state, dtype=torch.float32, device=config.device)
+
         with torch.no_grad():
-            at_tensor = model.act(st_tensor, deterministic=False)
-        action = at_tensor.cpu().numpy()
-        next_state, reward, term, trunc, _ = env.step(action.item())
-        # pos, vel = next_state
-        # reward += 0.1 * abs(vel) + 0.5 * pos
-        done = term or trunc
+            # Both models should expose .act(state, deterministic=False)
+            at = model.act(st, deterministic=False)
 
-        if mode == 'off_policy':
-            buffer.add(obs=state, next_obs=next_state, action=action, reward=reward, done=done, infos=[{}])
+        if algo == "sac":
+            action = at.cpu().numpy()  # continuous np.array
+            next_state, reward, term, trunc, _ = env.step(action)
         else:
-            states.append(state)
-            actions.append(action)
-            rewards.append(reward)
-            dones.append(done)
-            next_states.append(next_state)
+            action = at.item() if torch.is_tensor(at) else int(at)
+            next_state, reward, term, trunc, _ = env.step(action)
 
+        done = bool(term or trunc)
+
+        # Store
+        if mode == "off_policy":
+            buffer.add(
+                obs=state,
+                next_obs=next_state,
+                action=action,
+                reward=reward,
+                done=done,
+                infos=[{}],
+            )
+        else:
+            roll_states.append(state)
+            roll_actions.append(action)
+            roll_rewards.append(reward)
+            roll_dones.append(done)
+            roll_next.append(next_state)
+
+        # Bookkeeping
         state = next_state
         episode_reward += reward
         timestep += 1
+        pbar.update(1)
 
+        # Episode end
         if done:
             episodes_completed += 1
             recent_rewards.append(episode_reward)
-            wandb.log({'env/episode_reward': episode_reward})
-            avg100 = np.mean(recent_rewards)
-            if episodes_completed % log_frequency == 0:
-                tqdm.write(f"Ep {episodes_completed}, avg100 {avg100:.2f}")
-                wandb.log({'env/avg_reward_100': avg100, 'env/episodes': episodes_completed, 'env/timestep': timestep})
-            best_avg = save_model_on_best_reward(model, recent_rewards, best_avg)
+            wandb.log({"env/episode_reward": episode_reward, "env/timestep": timestep})
+            avg100 = float(np.mean(recent_rewards))
+            if episodes_completed % max(1, log_frequency) == 0:
+                tqdm.write(f"[{algo}] Ep {episodes_completed}, avg100 {avg100:.2f}")
+                wandb.log({"env/avg_reward_100": avg100, "env/episodes": episodes_completed})
+            best_avg = _save_model_on_best_reward(model, recent_rewards, best_avg)
             state, _ = env.reset()
-            episode_reward = 0
+            episode_reward = 0.0
 
-        # Off-policy update
-        if mode == 'off_policy' and buffer.size() >= batch_size:
-            batch = buffer.sample(batch_size=batch_size)
-            full = {
-                'states': batch.observations,
-                'actions': batch.actions,
-                'rewards': batch.rewards.unsqueeze(1),
-                'dones': batch.dones.unsqueeze(1).float(),
-                'next_states': batch.next_observations
-            }
-            with torch.no_grad(): model.prepare_training_data(full)
-            fs = model.critic_batch['states']
-            fa = model.critic_batch['actions']
-            adv = model.advantages
-            ret = model.critic_returns
-            ds = TensorDataset(fs, fa, adv, ret)
-            loader = DataLoader(ds, batch_size=critic_batch_size, shuffle=True)
-            trainer = pl.Trainer(max_epochs=num_epochs, accelerator='auto', logger=False)
-            trainer.fit(model, train_dataloaders=loader)
+        # ===========================
+        # UPDATES
+        # ===========================
 
-        # On-policy update
-        if mode == 'on_policy' and len(states) >= update_frequency:
-            st_t = torch.FloatTensor(np.array(states))
-            if continuous:
-                at_t = torch.FloatTensor(np.array(actions))
-            else:
-                at_t = torch.LongTensor(np.array(actions))
-            rw_t = torch.FloatTensor(np.array(rewards)).unsqueeze(1)
-            dn_t = torch.FloatTensor(np.array(dones)).unsqueeze(1)
-            nxt_t = torch.FloatTensor(np.array(next_states))
-            full = {'states': st_t, 'actions': at_t, 'rewards': rw_t, 'dones': dn_t, 'next_states': nxt_t}
-            with torch.no_grad(): model.prepare_training_data(full)
-            fs = model.critic_batch['states']
-            fa = model.critic_batch['actions']
-            adv = model.advantages
-            ret = model.critic_returns
-            ds = TensorDataset(fs, fa, adv, ret)
-            loader = DataLoader(ds, batch_size=critic_batch_size, shuffle=True)
-            trainer = pl.Trainer(max_epochs=num_epochs, accelerator='auto', logger=False)
-            trainer.fit(model, train_dataloaders=loader)
-            # clear
-            states, actions, rewards, dones, next_states = [], [], [], [], []
+        # OFF-POLICY (SAC)
+        if algo == "sac":
+            if buffer.size() >= critic_batch_size and (timestep % max(1, update_frequency) == 0):
+                batch = buffer.sample(batch_size=max(critic_batch_size, 2048))
+                ds = TensorDataset(
+                    batch.observations,
+                    batch.actions,
+                    batch.rewards.unsqueeze(1),
+                    batch.next_observations,
+                    batch.dones.unsqueeze(1).float(),
+                )
+                loader = DataLoader(ds, batch_size=critic_batch_size, shuffle=True, drop_last=True)
+                trainer = pl.Trainer(max_epochs=num_epochs, accelerator="auto", logger=False)
+                trainer.fit(model, train_dataloaders=loader)
+                
 
-        pbar.update(1)
+        # ON-POLICY (PPO-style with flow critic)
+        if algo == "ppo_flow":
+            if len(roll_states) >= update_frequency:
+                st_t = torch.as_tensor(np.array(roll_states), dtype=torch.float32)
+                at_t = torch.as_tensor(np.array(roll_actions), dtype=torch.long)
+                rw_t = torch.as_tensor(np.array(roll_rewards), dtype=torch.float32).unsqueeze(1)
+                dn_t = torch.as_tensor(np.array(roll_dones), dtype=torch.float32).unsqueeze(1)
+                nx_t = torch.as_tensor(np.array(roll_next), dtype=torch.float32)
 
-    # final save
+                full = {"states": st_t, "actions": at_t, "rewards": rw_t, "dones": dn_t, "next_states": nx_t}
+                with torch.no_grad():
+                    model.prepare_training_data(full)
+
+                fs = model.critic_batch["states"]
+                fa = model.critic_batch["actions"]
+                adv = model.advantages
+                ret = model.critic_returns
+
+                ds = TensorDataset(fs, fa, adv, ret)
+                loader = DataLoader(ds, batch_size=critic_batch_size, shuffle=True, drop_last=True)
+                trainer = pl.Trainer(max_epochs=num_epochs, accelerator="auto", logger=False)
+                trainer.fit(model, train_dataloaders=loader)
+
+                roll_states, roll_actions, roll_rewards, roll_dones, roll_next = [], [], [], [], []
+        model = model.to(config.device)
+
+    # -----------------------
+    # Final save & close
+    # -----------------------
     os.makedirs("./checkpoints/final/", exist_ok=True)
     fp = os.path.join("./checkpoints/final/", f"final_model_{total_timesteps}.ckpt")
     torch.save(model.state_dict(), fp)
     tqdm.write(f"Done. Saved to {fp}")
     env.close()
     wandb.finish()
-    return best_avg + avg100
+
+    return float(np.mean(recent_rewards)) if len(recent_rewards) > 0 else -np.inf
